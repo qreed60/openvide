@@ -1,0 +1,570 @@
+import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
+import { log } from "./utils.js";
+import type { TeamConfig, TeamMember } from "./types.js";
+
+const MAX_CYCLES = 3;
+const MAX_TASKS_PER_CYCLE = 2;
+
+export interface DelegationTask {
+  to: string;
+  task: string;
+  expected_summary: string;
+}
+
+export interface DelegationResult {
+  to: string;
+  task: string;
+  status: "completed" | "blocked" | "failed";
+  resultBlock: string;
+  fullResponse: string;
+  error?: string;
+}
+
+export interface TeamOrchestratorState {
+  runId: string;
+  teamId: string;
+  userText: string;
+  leadName?: string;
+  lastLeadResponse?: string;
+  finalText?: string;
+  pendingTasks?: DelegationTask[];
+  results?: DelegationResult[];
+  cycles: number;
+  invalidDelegationAttempts: number;
+  parseError?: string;
+  decision?: "final" | "delegate" | "invalid" | "fallback" | "force_final";
+  fallbackText?: string;
+}
+
+interface SessionCompletion {
+  status: "idle" | "failed" | "cancelled" | "interrupted";
+  responseText: string;
+  errorText?: string;
+}
+
+interface OrchestratorRuntime {
+  team: TeamConfig;
+  userText: string;
+  invokeMember: (member: TeamMember, prompt: string) => Promise<SessionCompletion>;
+  writeFinalMessage: (fromName: string, finalText: string) => void;
+  summarizePlan: (memberName: string) => string;
+  summarizeBoard: (memberName: string) => string;
+}
+
+export interface RunTeamOrchestratorInput extends OrchestratorRuntime {}
+
+const runtimes = new Map<string, OrchestratorRuntime>();
+let runCounter = 0;
+
+const OrchestratorAnnotation = Annotation.Root({
+  runId: Annotation<string>(),
+  teamId: Annotation<string>(),
+  userText: Annotation<string>(),
+  leadName: Annotation<string | undefined>(),
+  lastLeadResponse: Annotation<string | undefined>(),
+  finalText: Annotation<string | undefined>(),
+  pendingTasks: Annotation<DelegationTask[] | undefined>(),
+  results: Annotation<DelegationResult[] | undefined>(),
+  cycles: Annotation<number>(),
+  invalidDelegationAttempts: Annotation<number>(),
+  parseError: Annotation<string | undefined>(),
+  decision: Annotation<TeamOrchestratorState["decision"] | undefined>(),
+  fallbackText: Annotation<string | undefined>(),
+});
+
+function runtimeFor(state: TeamOrchestratorState): OrchestratorRuntime {
+  const runtime = runtimes.get(state.runId);
+  if (!runtime) {
+    throw new Error(`Missing team orchestrator runtime for ${state.runId}`);
+  }
+  return runtime;
+}
+
+function getCoordinator(team: TeamConfig): TeamMember | undefined {
+  return team.members.find((member) => member.role === "planner")
+    ?? team.members.find((member) => member.role === "lead")
+    ?? team.members[0];
+}
+
+function getMember(team: TeamConfig, name: string): TeamMember | undefined {
+  return team.members.find((member) => member.name === name);
+}
+
+function getRoleExecutionGuidance(role: TeamMember["role"]): string {
+  switch (role) {
+    case "coder":
+      return "You are the implementation owner. Create or modify files only when a delegated task explicitly allows edits.";
+    case "reviewer":
+      return "You are the reviewer/validator. Review, verify, and report concrete issues or risks.";
+    case "planner":
+      return "You are the planner. Coordinate work and delegate bounded tasks through OV_DELEGATE.";
+    case "lead":
+      return "You are the lead. Coordinate, delegate, unblock, and provide final user-facing answers.";
+    default:
+      return "";
+  }
+}
+
+function extractTaggedBlock(text: string, tag: string): string | null {
+  const pattern = new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*</${tag}>`, "i");
+  const match = text.match(pattern);
+  return match?.[1]?.trim() ?? null;
+}
+
+export function parseFinalBlock(text: string): string | null {
+  return extractTaggedBlock(text, "OV_FINAL");
+}
+
+export function parseDelegateBlock(text: string): DelegationTask[] | null {
+  const block = extractTaggedBlock(text, "OV_DELEGATE");
+  if (!block) return null;
+
+  const parsed = JSON.parse(block) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error("OV_DELEGATE must contain a JSON array");
+  }
+
+  return parsed.map((item, index) => {
+    if (!item || typeof item !== "object") {
+      throw new Error(`OV_DELEGATE task ${index + 1} must be an object`);
+    }
+    const task = item as Record<string, unknown>;
+    const to = typeof task.to === "string" ? task.to.trim() : "";
+    const taskText = typeof task.task === "string" ? task.task.trim() : "";
+    const expectedSummary = typeof task.expected_summary === "string" ? task.expected_summary.trim() : "";
+    if (!to || !taskText || !expectedSummary) {
+      throw new Error(`OV_DELEGATE task ${index + 1} requires to, task, and expected_summary`);
+    }
+    return { to, task: taskText, expected_summary: expectedSummary };
+  });
+}
+
+export function parseResultBlock(text: string): string | null {
+  const block = extractTaggedBlock(text, "OV_RESULT");
+  if (!block) return null;
+  return `<OV_RESULT>\n${block}\n</OV_RESULT>`;
+}
+
+export function buildLeadInitialPrompt(
+  team: TeamConfig,
+  lead: TeamMember,
+  userText: string,
+  summarizePlan: (memberName: string) => string,
+  summarizeBoard: (memberName: string) => string,
+): string {
+  const roster = team.members
+    .map((member) => `- ${member.name} (${member.role}, ${member.tool}${member.model ? `, ${member.model}` : ""})`)
+    .join("\n");
+
+  return [
+    `You are ${lead.name}, the ${lead.role} for OpenVide team "${team.name}".`,
+    getRoleExecutionGuidance(lead.role),
+    `Working directory: ${team.workingDirectory}`,
+    "",
+    "You are participating in daemon-side Team Chat orchestration.",
+    "You may answer directly only when no other member needs to run.",
+    "If another member should do work, do not simulate that member. Emit an OV_DELEGATE block and the daemon will invoke the selected member session directly.",
+    "",
+    "Team roster:",
+    roster,
+    "",
+    summarizePlan(lead.name),
+    "",
+    summarizeBoard(lead.name),
+    "",
+    "User objective:",
+    userText,
+    "",
+    "Choose exactly one response format.",
+    "",
+    "Final answer format:",
+    "<OV_FINAL>",
+    "Final answer to the user here.",
+    "</OV_FINAL>",
+    "",
+    "Delegation format:",
+    "<OV_DELEGATE>",
+    "[",
+    "{\"to\":\"ExactMemberName\",\"task\":\"Bounded task for this member.\",\"expected_summary\":\"What this member must report back.\"}",
+    "]",
+    "</OV_DELEGATE>",
+    "",
+    `Limits: at most ${MAX_TASKS_PER_CYCLE} delegated tasks in this cycle. Keep delegated tasks bounded.`,
+  ].join("\n");
+}
+
+export function buildLeadReviewPrompt(results: DelegationResult[]): string {
+  const resultText = results
+    .map((result) => [
+      `Result from ${result.to}:`,
+      result.resultBlock,
+      result.error ? `Error: ${result.error}` : "",
+    ].filter(Boolean).join("\n"))
+    .join("\n\n");
+
+  return [
+    "The following delegated tasks have completed.",
+    "",
+    "<OV_DELEGATION_RESULTS>",
+    resultText,
+    "</OV_DELEGATION_RESULTS>",
+    "",
+    "Based on these results, either:",
+    "1. emit another <OV_DELEGATE> block for one more bounded delegation cycle, or",
+    "2. emit an <OV_FINAL> block with the final user-facing answer.",
+    "",
+    "Do not pretend to call agents yourself. If more work is needed, emit OV_DELEGATE. If enough information is available, emit OV_FINAL.",
+  ].join("\n");
+}
+
+export function buildDelegatedTaskPrompt(team: TeamConfig, member: TeamMember, task: DelegationTask): string {
+  return [
+    `You are the OpenVide Team member named: ${member.name}.`,
+    `Your role is: ${member.role}.`,
+    `You are working in: ${team.workingDirectory}.`,
+    "",
+    "The Lead delegated this bounded task to you.",
+    "",
+    "<TASK>",
+    task.task,
+    "</TASK>",
+    "",
+    "Expected summary:",
+    task.expected_summary,
+    "",
+    "Rules:",
+    "* Complete only this delegated task.",
+    "* Do not delegate to another agent.",
+    "* Do not continue into unrelated work.",
+    "* Do not ask the user for information already present in the team context.",
+    "* Do not edit files unless the delegated task explicitly allows edits.",
+    "* If you edit files, list every file changed.",
+    "* End your response with exactly one result block.",
+    "",
+    "Required result format:",
+    "",
+    "<OV_RESULT>",
+    "status: completed | blocked | failed",
+    "summary:",
+    "files_changed:",
+    "tests_run:",
+    "risks:",
+    "recommended_next_step:",
+    "</OV_RESULT>",
+  ].join("\n");
+}
+
+function buildRepairPrompt(parseError: string, leadText: string): string {
+  return [
+    "Your previous Team Chat orchestration response could not be parsed.",
+    "",
+    `Parse error: ${parseError}`,
+    "",
+    "Previous response:",
+    leadText,
+    "",
+    "Emit exactly one valid response now:",
+    "",
+    "<OV_FINAL>",
+    "Final answer to the user here.",
+    "</OV_FINAL>",
+    "",
+    "or",
+    "",
+    "<OV_DELEGATE>",
+    "[{\"to\":\"ExactMemberName\",\"task\":\"Bounded task.\",\"expected_summary\":\"Expected summary.\"}]",
+    "</OV_DELEGATE>",
+    "",
+    "Do not include markdown fences around the JSON.",
+  ].join("\n");
+}
+
+function buildForceFinalPrompt(): string {
+  return [
+    `The daemon-side Team Chat orchestrator has reached maxCycles=${MAX_CYCLES}.`,
+    "You must now emit a final user-facing answer.",
+    "",
+    "<OV_FINAL>",
+    "Concise final answer based on the work completed and any remaining limitations.",
+    "</OV_FINAL>",
+  ].join("\n");
+}
+
+function blockedResult(to: string, task: string, summary: string): DelegationResult {
+  const resultBlock = [
+    "<OV_RESULT>",
+    "status: blocked",
+    `summary: ${summary}`,
+    "files_changed:",
+    "tests_run:",
+    "risks:",
+    "recommended_next_step: Lead should choose another available member or answer with current information.",
+    "</OV_RESULT>",
+  ].join("\n");
+  return { to, task, status: "blocked", resultBlock, fullResponse: resultBlock, error: summary };
+}
+
+function failedResult(to: string, task: string, summary: string): DelegationResult {
+  const resultBlock = [
+    "<OV_RESULT>",
+    "status: failed",
+    `summary: ${summary}`,
+    "files_changed:",
+    "tests_run:",
+    "risks:",
+    "recommended_next_step: Lead should account for this failure in the final answer or delegate a recovery task.",
+    "</OV_RESULT>",
+  ].join("\n");
+  return { to, task, status: "failed", resultBlock, fullResponse: resultBlock, error: summary };
+}
+
+function synthesizeResultBlock(status: DelegationResult["status"], summary: string): string {
+  return [
+    "<OV_RESULT>",
+    `status: ${status}`,
+    "summary:",
+    summary || "No structured result was returned.",
+    "files_changed:",
+    "tests_run:",
+    "risks:",
+    "recommended_next_step:",
+    "</OV_RESULT>",
+  ].join("\n");
+}
+
+async function leadTurn(state: TeamOrchestratorState): Promise<Partial<TeamOrchestratorState>> {
+  const runtime = runtimeFor(state);
+  const lead = getCoordinator(runtime.team);
+  if (!lead) {
+    return {
+      decision: "fallback",
+      fallbackText: "Team orchestration could not start because this team has no members.",
+    };
+  }
+
+  log(`team.orchestrator.lead team=${runtime.team.id} lead=${lead.name} cycle=${state.cycles}`);
+  const completion = await runtime.invokeMember(
+    lead,
+    buildLeadInitialPrompt(runtime.team, lead, runtime.userText, runtime.summarizePlan, runtime.summarizeBoard),
+  );
+  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  if (completion.status !== "idle") {
+    return {
+      leadName: lead.name,
+      decision: "fallback",
+      fallbackText: response || `Lead session failed with status ${completion.status}.`,
+    };
+  }
+  return { leadName: lead.name, lastLeadResponse: response };
+}
+
+async function leadRepairTurn(state: TeamOrchestratorState): Promise<Partial<TeamOrchestratorState>> {
+  const runtime = runtimeFor(state);
+  const lead = getCoordinator(runtime.team);
+  if (!lead) {
+    return { decision: "fallback", fallbackText: "No Lead is available to repair the delegation response." };
+  }
+
+  log(`team.orchestrator.error team=${runtime.team.id} reason=invalid_delegate repair=1`);
+  const completion = await runtime.invokeMember(
+    lead,
+    buildRepairPrompt(state.parseError ?? "Invalid OV_DELEGATE JSON", state.lastLeadResponse ?? ""),
+  );
+  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  return {
+    lastLeadResponse: response || state.lastLeadResponse,
+    invalidDelegationAttempts: state.invalidDelegationAttempts + 1,
+  };
+}
+
+function routeLeadDecision(state: TeamOrchestratorState): Partial<TeamOrchestratorState> {
+  const leadText = state.lastLeadResponse ?? "";
+  const finalText = parseFinalBlock(leadText);
+  if (finalText) {
+    return { decision: "final", finalText };
+  }
+
+  try {
+    const tasks = parseDelegateBlock(leadText);
+    if (tasks) {
+      if (state.cycles >= MAX_CYCLES) {
+        return { decision: "force_final", pendingTasks: undefined };
+      }
+      return { decision: "delegate", pendingTasks: tasks.slice(0, MAX_TASKS_PER_CYCLE), parseError: undefined };
+    }
+  } catch (err) {
+    const parseError = err instanceof Error ? err.message : String(err);
+    if (state.invalidDelegationAttempts < 1) {
+      return { decision: "invalid", parseError };
+    }
+    return {
+      decision: "fallback",
+      parseError,
+      fallbackText: leadText || `Lead emitted invalid OV_DELEGATE JSON: ${parseError}`,
+    };
+  }
+
+  return {
+    decision: "fallback",
+    fallbackText: leadText || "Lead did not emit OV_FINAL or OV_DELEGATE.",
+  };
+}
+
+async function runDelegations(state: TeamOrchestratorState): Promise<Partial<TeamOrchestratorState>> {
+  const runtime = runtimeFor(state);
+  const tasks = (state.pendingTasks ?? []).slice(0, MAX_TASKS_PER_CYCLE);
+  const results: DelegationResult[] = [];
+
+  for (const task of tasks) {
+    log(`team.orchestrator.delegate team=${runtime.team.id} to=${task.to}`);
+    const member = getMember(runtime.team, task.to);
+    if (!member) {
+      results.push(blockedResult(task.to, task.task, `Unknown team member: ${task.to}`));
+      continue;
+    }
+
+    const completion = await runtime.invokeMember(member, buildDelegatedTaskPrompt(runtime.team, member, task));
+    const raw = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+    if (completion.status !== "idle") {
+      const status = raw.toLowerCase().includes("already running") || raw.toLowerCase().includes(" is running")
+        ? "blocked"
+        : "failed";
+      results.push(status === "blocked"
+        ? blockedResult(task.to, task.task, raw || `Session for ${task.to} is busy`)
+        : failedResult(task.to, task.task, raw || `${task.to} failed with status ${completion.status}`));
+      continue;
+    }
+
+    const resultBlock = parseResultBlock(raw) ?? synthesizeResultBlock("completed", raw);
+    results.push({
+      to: task.to,
+      task: task.task,
+      status: resultBlock.toLowerCase().includes("status: failed")
+        ? "failed"
+        : resultBlock.toLowerCase().includes("status: blocked")
+          ? "blocked"
+          : "completed",
+      resultBlock,
+      fullResponse: raw,
+    });
+    log(`team.orchestrator.result team=${runtime.team.id} from=${task.to}`);
+  }
+
+  return {
+    results,
+    cycles: state.cycles + 1,
+    pendingTasks: undefined,
+  };
+}
+
+async function leadReviewTurn(state: TeamOrchestratorState): Promise<Partial<TeamOrchestratorState>> {
+  const runtime = runtimeFor(state);
+  const lead = getCoordinator(runtime.team);
+  if (!lead) {
+    return { decision: "fallback", fallbackText: "No Lead is available to review delegation results." };
+  }
+
+  log(`team.orchestrator.lead team=${runtime.team.id} lead=${lead.name} reviewCycle=${state.cycles}`);
+  const completion = await runtime.invokeMember(lead, buildLeadReviewPrompt(state.results ?? []));
+  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  if (completion.status !== "idle") {
+    return {
+      decision: "fallback",
+      fallbackText: response || `Lead review turn failed with status ${completion.status}.`,
+    };
+  }
+  return { lastLeadResponse: response };
+}
+
+async function forceFinal(state: TeamOrchestratorState): Promise<Partial<TeamOrchestratorState>> {
+  const runtime = runtimeFor(state);
+  const lead = getCoordinator(runtime.team);
+  if (!lead) {
+    return { fallbackText: "Team orchestration hit maxCycles and no Lead is available for a final answer." };
+  }
+
+  log(`team.orchestrator.error team=${runtime.team.id} reason=max_cycles`);
+  const completion = await runtime.invokeMember(lead, buildForceFinalPrompt());
+  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  const finalText = parseFinalBlock(response);
+  if (finalText) {
+    return { finalText, decision: "final" };
+  }
+
+  return {
+    fallbackText: [
+      "Team orchestration reached the maximum delegation cycles.",
+      response ? `Lead response: ${response}` : "The Lead did not produce an OV_FINAL response.",
+    ].join("\n"),
+  };
+}
+
+function routeAfterDecision(state: TeamOrchestratorState): string {
+  return state.decision ?? "fallback";
+}
+
+function routeAfterReview(state: TeamOrchestratorState): string {
+  return state.decision ?? "fallback";
+}
+
+const graph = new StateGraph(OrchestratorAnnotation)
+  .addNode("leadTurn", leadTurn)
+  .addNode("routeLeadDecision", routeLeadDecision)
+  .addNode("runDelegations", runDelegations)
+  .addNode("leadReviewTurn", leadReviewTurn)
+  .addNode("leadRepairTurn", leadRepairTurn)
+  .addNode("forceFinal", forceFinal)
+  .addEdge(START, "leadTurn")
+  .addEdge("leadTurn", "routeLeadDecision")
+  .addConditionalEdges("routeLeadDecision", routeAfterDecision, {
+    final: END,
+    delegate: "runDelegations",
+    invalid: "leadRepairTurn",
+    fallback: END,
+    force_final: "forceFinal",
+  })
+  .addEdge("leadRepairTurn", "routeLeadDecision")
+  .addEdge("runDelegations", "leadReviewTurn")
+  .addEdge("leadReviewTurn", "routeLeadDecision")
+  .addConditionalEdges("forceFinal", routeAfterReview, {
+    final: END,
+    fallback: END,
+    delegate: END,
+    invalid: END,
+    force_final: END,
+  })
+  .compile();
+
+export async function runTeamOrchestrator(input: RunTeamOrchestratorInput): Promise<void> {
+  const lead = getCoordinator(input.team);
+  const runId = `team_orch_${Date.now()}_${++runCounter}`;
+  runtimes.set(runId, input);
+  log(`team.orchestrator.start team=${input.team.id} lead=${lead?.name ?? "none"}`);
+
+  try {
+    const finalState = await graph.invoke({
+      runId,
+      teamId: input.team.id,
+      userText: input.userText,
+      leadName: lead?.name,
+      cycles: 0,
+      invalidDelegationAttempts: 0,
+    }) as TeamOrchestratorState;
+
+    const finalText = finalState.finalText ?? finalState.fallbackText;
+    if (!finalText) {
+      log(`team.orchestrator.error team=${input.team.id} reason=no_final`);
+      input.writeFinalMessage(lead?.name ?? "Lead", "Team orchestration ended without a final answer.");
+      return;
+    }
+
+    log(`team.orchestrator.final team=${input.team.id} lead=${lead?.name ?? "Lead"}`);
+    input.writeFinalMessage(lead?.name ?? "Lead", finalText);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`team.orchestrator.error team=${input.team.id} reason=exception error=${message}`);
+    input.writeFinalMessage(lead?.name ?? "Lead", `Team orchestration failed: ${message}`);
+  } finally {
+    runtimes.delete(runId);
+  }
+}

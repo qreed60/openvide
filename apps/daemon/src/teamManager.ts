@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { daemonDir, newId, nowISO, log, logError } from "./utils.js";
 import * as sm from "./sessionManager.js";
+import { runTeamOrchestrator } from "./teamOrchestrator.js";
 import type {
   TeamConfig, TeamMember, TeamTask, TaskStatus, TaskComment,
   TeamMessage, TeamPlan, PlanRevision, PlanReviewVote, PlanMode,
@@ -719,14 +720,23 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
 
   const msg = writeTeamMessage(teamId, { from, to, text });
 
-  // Team-level user messages go to the coordinator instead of blindly fanning out.
   if (to === "*") {
     if (from === "user") {
-      const coordinator = getCoordinator(team);
-      if (coordinator) {
-        injectMessage(coordinator, from, to, text, teamId);
-        return msg;
-      }
+      void runTeamOrchestrator({
+        team,
+        userText: text,
+        invokeMember: invokeMemberTurn,
+        writeFinalMessage: (fromName, finalText) => {
+          writeTeamMessage(teamId, {
+            from: fromName,
+            to: "user",
+            text: finalText.slice(0, 4000),
+          });
+        },
+        summarizePlan: (memberName) => summarizePlanForChat(teamId, memberName),
+        summarizeBoard: (memberName) => summarizeBoardForChat(teamId, memberName),
+      });
+      return msg;
     }
     for (const member of team.members) {
       if (member.name !== from) {
@@ -743,30 +753,71 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
   return msg;
 }
 
+function invokeMemberTurn(member: TeamMember, prompt: string): Promise<SessionCompletion> {
+  const session = sm.getSession(member.sessionId);
+  if (!session || session.status !== "idle") {
+    return Promise.resolve({
+      status: "failed",
+      responseText: "",
+      errorText: session
+        ? `Session ${member.sessionId} for ${member.name} is ${session.status}`
+        : `Session ${member.sessionId} for ${member.name} was not found`,
+    });
+  }
+
+  if (activeWatchers.has(member.sessionId)) {
+    return Promise.resolve({
+      status: "failed",
+      responseText: "",
+      errorText: `Session ${member.sessionId} for ${member.name} already has a pending watcher`,
+    });
+  }
+
+  try {
+    const result = sm.sendTurn(member.sessionId, prompt);
+    if (!result.ok) {
+      throw new Error(result.error ?? `Failed to send team chat turn to ${member.name}`);
+    }
+
+    return new Promise((resolve) => {
+      watchSessionResponse(member.sessionId, resolve);
+    });
+  } catch (err) {
+    log(`[team] Failed to inject message to ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
+    return Promise.resolve({
+      status: "failed",
+      responseText: "",
+      errorText: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function sendPromptToMember(member: TeamMember, prompt: string, teamId: string): boolean {
+  if (activeWatchers.has(member.sessionId)) {
+    return false;
+  }
+
+  void invokeMemberTurn(member, prompt)
+    .then((completion) => {
+      const output = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+      if (!output) return;
+      writeTeamMessage(teamId, {
+        from: member.name,
+        to: "user",
+        text: output.slice(0, 2000),
+      });
+      log(`[team] Captured response from ${member.name} (${output.length} chars)`);
+    })
+    .catch((err: unknown) => {
+      log(`[team] Failed to capture response from ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  return true;
+}
+
 function injectMessage(member: TeamMember, from: string, to: string, text: string, teamId: string): void {
   const team = getTeam(teamId);
   if (!team) return;
-  const session = sm.getSession(member.sessionId);
-  if (session && session.status === "idle") {
-    try {
-      const prompt = buildChatPrompt(team, member, from, to, text);
-      const result = sm.sendTurn(member.sessionId, prompt);
-      if (result.ok) {
-        watchSessionResponse(member.sessionId, (completion) => {
-          const output = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
-          if (!output) return;
-          writeTeamMessage(teamId, {
-            from: member.name,
-            to: "user",
-            text: output.slice(0, 2000),
-          });
-          log(`[team] Captured response from ${member.name} (${output.length} chars)`);
-        });
-      }
-    } catch (err) {
-      log(`[team] Failed to inject message to ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  sendPromptToMember(member, buildChatPrompt(team, member, from, to, text), teamId);
 }
 
 type SessionCompletion = {
@@ -791,7 +842,13 @@ function watchSessionResponse(sessionId: string, onComplete: (result: SessionCom
     const session = sm.getSession(sessionId);
     if (!session || polls >= maxPolls) {
       clearInterval(interval);
+      const handler = activeWatchers.get(sessionId);
       activeWatchers.delete(sessionId);
+      handler?.({
+        status: "failed",
+        responseText: "",
+        errorText: session ? `Timed out waiting for session ${sessionId}` : `Session ${sessionId} not found`,
+      });
       return;
     }
 
