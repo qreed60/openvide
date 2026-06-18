@@ -14,11 +14,12 @@ import * as path from "node:path";
 import { daemonDir, newId, nowISO, log, logError } from "./utils.js";
 import * as sm from "./sessionManager.js";
 import { runTeamOrchestrator } from "./teamOrchestrator.js";
+import { isExecutableTeamTool } from "./teamMetadata.js";
 import { getCoordinatorMember, normalizeTeamRole, roleMatches } from "./teamRoles.js";
 import type {
   TeamConfig, TeamMember, TeamTask, TaskStatus, TaskComment,
   TeamMessage, TeamMessageOrchestration, TeamPlan, PlanRevision, PlanReviewVote, PlanMode,
-  Tool, IpcResponse,
+  Tool, IpcResponse, TeamRoutingPolicy,
 } from "./types.js";
 
 const TEAMS_DIR = path.join(daemonDir(), "teams");
@@ -67,20 +68,38 @@ function readJsonl<T>(filePath: string, limit?: number): T[] {
   } catch { return []; }
 }
 
+function normalizeRoutingPolicy(policy: TeamRoutingPolicy | undefined): TeamRoutingPolicy | undefined {
+  if (!policy) return undefined;
+  const next: TeamRoutingPolicy = {};
+  if (typeof policy.maxCycles === "number" && Number.isFinite(policy.maxCycles)) next.maxCycles = Math.max(1, Math.floor(policy.maxCycles));
+  if (typeof policy.maxTasksPerCycle === "number" && Number.isFinite(policy.maxTasksPerCycle)) next.maxTasksPerCycle = Math.max(1, Math.floor(policy.maxTasksPerCycle));
+  if (typeof policy.maxParallelTasks === "number" && Number.isFinite(policy.maxParallelTasks)) next.maxParallelTasks = Math.max(1, Math.floor(policy.maxParallelTasks));
+  if (typeof policy.requireReviewForWrites === "boolean") next.requireReviewForWrites = policy.requireReviewForWrites;
+  if (typeof policy.defaultReadOnly === "boolean") next.defaultReadOnly = policy.defaultReadOnly;
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function executableToolOrThrow(tool: string): Tool {
+  if (isExecutableTeamTool(tool)) return tool;
+  throw new Error(`Team provider ${tool || "(missing)"} is not enabled for execution`);
+}
+
 // ── Team CRUD ──
 
 export function createTeam(
   name: string,
   workingDirectory: string,
-  members: Array<{ name: string; tool: Tool; model?: string; role: string }>,
+  members: Array<{ name: string; tool: string; model?: string; role: string }>,
+  routingPolicy?: TeamRoutingPolicy,
 ): TeamConfig {
   const teamId = newId("team");
   const now = nowISO();
 
   // Create a daemon session for each member
   const resolvedMembers: TeamMember[] = members.map((m) => {
+    const tool = executableToolOrThrow(m.tool);
     const session = sm.createSession(
-      m.tool,
+      tool,
       workingDirectory,
       m.model,
       undefined,
@@ -89,7 +108,7 @@ export function createTeam(
     );
     return {
       name: m.name,
-      tool: m.tool,
+      tool,
       model: m.model,
       role: normalizeTeamRole(m.role),
       sessionId: session.id,
@@ -101,6 +120,7 @@ export function createTeam(
     name,
     workingDirectory,
     members: resolvedMembers,
+    routingPolicy: normalizeRoutingPolicy(routingPolicy),
     createdAt: now,
     updatedAt: now,
   };
@@ -124,7 +144,8 @@ export function updateTeam(
   updates: {
     name?: string;
     workingDirectory?: string;
-    members?: Array<{ name: string; tool: Tool; model?: string; role: string }>;
+    members?: Array<{ name: string; tool: string; model?: string; role: string }>;
+    routingPolicy?: TeamRoutingPolicy;
   },
 ): TeamConfig | null {
   const state = sm.getState();
@@ -162,8 +183,9 @@ export function updateTeam(
       };
     }
 
+    const tool = executableToolOrThrow(member.tool);
     const session = sm.createSession(
-      member.tool,
+      tool,
       nextWorkingDirectory,
       member.model,
       undefined,
@@ -172,7 +194,7 @@ export function updateTeam(
     );
     return {
       name: member.name,
-      tool: member.tool,
+      tool,
       model: member.model,
       role: normalizeTeamRole(member.role),
       sessionId: session.id,
@@ -190,6 +212,7 @@ export function updateTeam(
     name: nextName,
     workingDirectory: nextWorkingDirectory,
     members: resolvedMembers,
+    routingPolicy: updates.routingPolicy === undefined ? current.routingPolicy : normalizeRoutingPolicy(updates.routingPolicy),
     updatedAt: nowISO(),
   };
 

@@ -1,13 +1,18 @@
 import type { TeamConfig, TeamMember } from "./types.js";
+import { SUPPORTED_TEAM_ROLES } from "./teamMetadata.js";
+
+const ROLE_ALIASES = new Map<string, string>();
+for (const role of SUPPORTED_TEAM_ROLES) {
+  ROLE_ALIASES.set(role.id, role.id);
+  for (const alias of role.aliases) {
+    ROLE_ALIASES.set(alias, role.id);
+  }
+}
 
 export function normalizeTeamRole(role: string | undefined): TeamMember["role"] {
   const raw = (role ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
-  if (raw === "coordinator") return "lead";
-  if (raw === "lead") return "lead";
-  if (raw === "tester") return "tester";
-  if (raw === "visual" || raw === "visual_reviewer") return raw;
-  if (raw === "scribe") return "scribe";
-  if (raw === "coder" || raw === "reviewer" || raw === "planner") return raw;
+  const normalized = ROLE_ALIASES.get(raw);
+  if (normalized) return normalized as TeamMember["role"];
   return (raw || "coder") as TeamMember["role"];
 }
 

@@ -17,6 +17,7 @@ import * as tm from "./teamManager.js";
 import * as sched from "./scheduleManager.js";
 import { detailOrchestratorRun, getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
 import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
+import { getTeamMetadata } from "./teamMetadata.js";
 
 const SOCKET_NAME = "daemon.sock";
 
@@ -656,6 +657,11 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
 
     // ── Team commands ──
 
+    case "team.metadata": {
+      const tools = await detectInstalledTools();
+      return { ok: true, teamMetadata: getTeamMetadata(tools) };
+    }
+
     case "team.create": {
       const name = req.name as string | undefined;
       const cwd = req.cwd as string | undefined;
@@ -664,7 +670,7 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
         return { ok: false, error: "Missing required: name, cwd, members" };
       }
       try {
-        const team = tm.createTeam(name, cwd, members as any[]);
+        const team = tm.createTeam(name, cwd, members, req.routingPolicy as import("./types.js").TeamRoutingPolicy | undefined);
         return { ok: true, team };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -721,7 +727,8 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       const team = tm.updateTeam(teamId, {
         name: req.name as string | undefined,
         workingDirectory: req.cwd as string | undefined,
-        members: req.members as Array<{ name: string; tool: Tool; model?: string; role: string }> | undefined,
+        members: req.members as Array<{ name: string; tool: string; model?: string; role: string }> | undefined,
+        routingPolicy: req.routingPolicy as import("./types.js").TeamRoutingPolicy | undefined,
       });
       if (!team) return { ok: false, error: `Team ${teamId} not found` };
       return { ok: true, team };

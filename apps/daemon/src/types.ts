@@ -1,3 +1,5 @@
+import type { TeamMetadata } from "./teamMetadata.js";
+
 // ── Session & State ──
 
 export type Tool = "claude" | "codex" | "gemini";
@@ -255,6 +257,7 @@ export interface IpcResponse {
   activeSessions?: number;
   totalSessions?: number;
   tools?: Record<string, boolean>;
+  teamMetadata?: TeamMetadata;
   orchestrator?: { available: boolean; enabled: boolean; provider: string; runStore: boolean };
   orchestratorRuns?: unknown[];
   orchestratorRun?: unknown;
@@ -340,6 +343,7 @@ export type AgentRole =
   | "tester"
   | "visual"
   | "visual_reviewer"
+  | "domain_specialist"
   | (string & {});
 
 export interface TeamMember {
@@ -348,6 +352,14 @@ export interface TeamMember {
   model?: string;
   role: AgentRole;
   sessionId: string;
+}
+
+export interface TeamRoutingPolicy {
+  maxCycles?: number;
+  maxTasksPerCycle?: number;
+  maxParallelTasks?: number;
+  requireReviewForWrites?: boolean;
+  defaultReadOnly?: boolean;
 }
 
 export type TaskStatus = "todo" | "in_progress" | "done" | "review" | "approved";
@@ -406,6 +418,7 @@ export interface TeamConfig {
   name: string;
   workingDirectory: string;
   members: TeamMember[];
+  routingPolicy?: TeamRoutingPolicy;
   taskCount?: number;
   tasksTotal?: number;
   tasksDone?: number;
