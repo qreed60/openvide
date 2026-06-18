@@ -255,6 +255,9 @@ export interface IpcResponse {
   activeSessions?: number;
   totalSessions?: number;
   tools?: Record<string, boolean>;
+  orchestrator?: { available: boolean; enabled: boolean; provider: string; runStore: boolean };
+  orchestratorRuns?: unknown[];
+  orchestratorRun?: unknown;
   bridgeUrl?: string;
   bridgeToken?: string;
   bridgeStatus?: { enabled: boolean; port: number; tls: boolean; bindHost: string; connections: number };
@@ -328,7 +331,16 @@ export interface SessionEventRecord {
 
 // ── Agent Teams ──
 
-export type AgentRole = "lead" | "coder" | "reviewer" | "planner";
+export type AgentRole =
+  | "lead"
+  | "coder"
+  | "reviewer"
+  | "planner"
+  | "scribe"
+  | "tester"
+  | "visual"
+  | "visual_reviewer"
+  | (string & {});
 
 export interface TeamMember {
   name: string;
@@ -369,6 +381,24 @@ export interface TeamMessage {
   to: string;
   text: string;
   createdAt: string;
+  orchestration?: TeamMessageOrchestration;
+}
+
+export interface TeamMessageOrchestration {
+  runId: string;
+  teamId: string;
+  status: "completed" | "blocked" | "failed";
+  route: string[];
+  routeSummary: string;
+  timeline: Array<{
+    memberName?: string;
+    role?: string;
+    tool?: Tool;
+    model?: string;
+    status?: "started" | "completed" | "blocked" | "failed";
+    durationMs?: number;
+    summary?: string;
+  }>;
 }
 
 export interface TeamConfig {

@@ -14,9 +14,10 @@ import * as path from "node:path";
 import { daemonDir, newId, nowISO, log, logError } from "./utils.js";
 import * as sm from "./sessionManager.js";
 import { runTeamOrchestrator } from "./teamOrchestrator.js";
+import { getCoordinatorMember, normalizeTeamRole, roleMatches } from "./teamRoles.js";
 import type {
   TeamConfig, TeamMember, TeamTask, TaskStatus, TaskComment,
-  TeamMessage, TeamPlan, PlanRevision, PlanReviewVote, PlanMode,
+  TeamMessage, TeamMessageOrchestration, TeamPlan, PlanRevision, PlanReviewVote, PlanMode,
   Tool, IpcResponse,
 } from "./types.js";
 
@@ -90,7 +91,7 @@ export function createTeam(
       name: m.name,
       tool: m.tool,
       model: m.model,
-      role: m.role as TeamMember["role"],
+      role: normalizeTeamRole(m.role),
       sessionId: session.id,
     };
   });
@@ -137,7 +138,7 @@ export function updateTeam(
       name: member.name.trim(),
       tool: member.tool,
       model: member.model,
-      role: member.role,
+      role: normalizeTeamRole(member.role),
     }))
     .filter((member) => member.name.length > 0);
 
@@ -156,7 +157,7 @@ export function updateTeam(
       reusedSessionIds.add(existing.sessionId);
       return {
         ...existing,
-        role: member.role as TeamMember["role"],
+        role: normalizeTeamRole(member.role),
         model: member.model,
       };
     }
@@ -173,7 +174,7 @@ export function updateTeam(
       name: member.name,
       tool: member.tool,
       model: member.model,
-      role: member.role as TeamMember["role"],
+      role: normalizeTeamRole(member.role),
       sessionId: session.id,
     };
   });
@@ -334,7 +335,7 @@ function handleTaskStatusChange(teamId: string, task: TeamTask, newStatus: TaskS
 
   if (newStatus === "done" || newStatus === "review") {
     // Auto-send to reviewer
-    const reviewer = team.members.find((m) => m.role === "reviewer");
+    const reviewer = team.members.find((m) => roleMatches(m, ["reviewer", "tester", "visual_reviewer"]));
     if (reviewer) {
       sendTaskToReviewer(team, reviewer, task);
     }
@@ -500,7 +501,7 @@ export function addComment(teamId: string, taskId: string, author: string, text:
 
 function writeTeamMessage(
   teamId: string,
-  input: { from: string; to: string; text: string; fromTool?: Tool },
+  input: { from: string; to: string; text: string; fromTool?: Tool; orchestration?: TeamMessageOrchestration },
 ): TeamMessage {
   const team = getTeam(teamId);
   const memberTool = team?.members.find((member) => member.name === input.from)?.tool;
@@ -511,6 +512,7 @@ function writeTeamMessage(
     fromTool: input.fromTool ?? memberTool,
     to: input.to,
     text: input.text,
+    orchestration: input.orchestration,
     createdAt: nowISO(),
   };
   appendJsonl(path.join(teamDir(teamId), "messages.jsonl"), msg);
@@ -519,21 +521,19 @@ function writeTeamMessage(
 }
 
 function getCoordinator(team: TeamConfig): TeamMember | undefined {
-  return team.members.find((member) => member.role === "planner")
-    ?? team.members.find((member) => member.role === "lead")
-    ?? team.members[0];
+  return getCoordinatorMember(team);
 }
 
 function getPrimaryCoder(team: TeamConfig): TeamMember | undefined {
-  return team.members.find((member) => member.role === "coder");
+  return team.members.find((member) => roleMatches(member, ["coder", "scribe", "tester", "visual"]));
 }
 
 function getPrimaryReviewer(team: TeamConfig): TeamMember | undefined {
-  return team.members.find((member) => member.role === "reviewer");
+  return team.members.find((member) => roleMatches(member, ["reviewer", "tester", "visual_reviewer"]));
 }
 
 function getRoleExecutionGuidance(role: TeamMember["role"]): string {
-  switch (role) {
+  switch (normalizeTeamRole(role)) {
     case "coder":
       return "You are the implementation owner. Create or modify the required files yourself and deliver the concrete artifact.";
     case "reviewer":
@@ -542,6 +542,14 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
       return "You are the planner. Break down work, coordinate next steps, and only implement directly if the task explicitly requires planning artifacts.";
     case "lead":
       return "You are the lead. Coordinate, unblock, and provide final sign-off. Do not take over hands-on implementation unless the task explicitly requires it.";
+    case "scribe":
+      return "You are the scribe. Capture decisions, summarize work clearly, and turn rough findings into concise team updates.";
+    case "tester":
+      return "You are the tester. Validate behavior, run focused checks when appropriate, and report concrete pass/fail status and risks.";
+    case "visual":
+      return "You are the visual specialist. Focus on UI quality, layout, interaction details, and visible regressions.";
+    case "visual_reviewer":
+      return "You are the visual reviewer. Review UI changes for layout, clarity, polish, and visible regressions.";
     default:
       return "";
   }
@@ -600,13 +608,13 @@ function buildChatPrompt(team: TeamConfig, member: TeamMember, from: string, to:
   const coordinatorMessage = to === "*" && getCoordinator(team)?.name === member.name;
 
   const extraGuidance = [
-    member.role === "reviewer"
+    roleMatches(member, ["reviewer", "tester", "visual_reviewer"])
       ? "If the user refers to \"this plan\" or \"the plan\", assume they mean the latest team plan summarized below unless they specify otherwise."
       : "",
     coordinatorMessage
       ? "You are handling a team-level request. Coordinate using the latest plan and board context below. Delegate by role rather than taking over implementation yourself unless implementation is explicitly assigned to you."
       : "",
-    directMessage && member.role === "coder"
+    directMessage && roleMatches(member, ["coder"])
       ? "If the request is asking for implementation or file creation, treat yourself as the hands-on owner unless the latest plan clearly assigns that work to someone else."
       : "",
     "Use the team context below. Do not ask the user to paste information that is already included here.",
@@ -726,11 +734,12 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
         team,
         userText: text,
         invokeMember: invokeMemberTurn,
-        writeFinalMessage: (fromName, finalText) => {
+        writeFinalMessage: (fromName, finalText, orchestration) => {
           writeTeamMessage(teamId, {
             from: fromName,
             to: "user",
             text: finalText.slice(0, 4000),
+            orchestration,
           });
         },
         summarizePlan: (memberName) => summarizePlanForChat(teamId, memberName),
@@ -916,9 +925,9 @@ function parsePlanTasksFromResponse(team: TeamConfig, responseText: string): Pla
     throw new Error("Planner response did not include tasks");
   }
 
-  const fallbackOwner = team.members.find((member) => member.role === "coder")
+  const fallbackOwner = team.members.find((member) => roleMatches(member, ["coder", "scribe", "tester", "visual"]))
     ?.name
-    ?? team.members.find((member) => member.role === "planner" || member.role === "lead")
+    ?? getCoordinator(team)
       ?.name
     ?? team.members[0]?.name
     ?? "unassigned";
@@ -1003,9 +1012,7 @@ export function generatePlan(
   const team = getTeam(teamId);
   if (!team) throw new Error(`Team ${teamId} not found`);
 
-  const planner = team.members.find((member) => member.role === "planner")
-    ?? team.members.find((member) => member.role === "lead")
-    ?? team.members[0];
+  const planner = getCoordinator(team);
   if (!planner) throw new Error(`Team ${teamId} has no members`);
 
   writeTeamMessage(teamId, {
@@ -1061,7 +1068,7 @@ export function submitPlan(
   const planId = newId("plan");
   const now = nowISO();
   const mode = opts?.mode ?? "simple";
-  const reviewers = opts?.reviewers ?? team.members.filter((m) => m.role === "reviewer").map((m) => m.name);
+  const reviewers = opts?.reviewers ?? team.members.filter((m) => roleMatches(m, ["reviewer", "tester", "visual_reviewer"])).map((m) => m.name);
   const maxIterations = opts?.maxIterations ?? 5;
 
   const revision: PlanRevision = {
@@ -1351,8 +1358,7 @@ function sendRevisionRequest(
   feedbacks: Array<{ reviewer: string; feedback: string }>,
 ): void {
   const planner = team.members.find((m) => m.name === plan.createdBy)
-    ?? team.members.find((m) => m.role === "planner")
-    ?? team.members.find((m) => m.role === "lead");
+    ?? getCoordinator(team);
   if (!planner) return;
 
   const feedbackList = feedbacks.map((f) => `- ${f.reviewer}: ${f.feedback}`).join("\n");

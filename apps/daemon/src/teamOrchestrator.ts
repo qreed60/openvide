@@ -1,6 +1,13 @@
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 import { log } from "./utils.js";
-import type { TeamConfig, TeamMember } from "./types.js";
+import {
+  appendOrchestratorEvent,
+  createMessageOrchestration,
+  finishOrchestratorRun,
+  startOrchestratorRun,
+} from "./orchestratorRunStore.js";
+import { getCoordinatorMember, normalizeTeamRole } from "./teamRoles.js";
+import type { TeamConfig, TeamMember, TeamMessageOrchestration } from "./types.js";
 
 const MAX_CYCLES = 3;
 const MAX_TASKS_PER_CYCLE = 2;
@@ -46,7 +53,7 @@ interface OrchestratorRuntime {
   team: TeamConfig;
   userText: string;
   invokeMember: (member: TeamMember, prompt: string) => Promise<SessionCompletion>;
-  writeFinalMessage: (fromName: string, finalText: string) => void;
+  writeFinalMessage: (fromName: string, finalText: string, orchestration?: TeamMessageOrchestration) => void;
   summarizePlan: (memberName: string) => string;
   summarizeBoard: (memberName: string) => string;
 }
@@ -81,9 +88,7 @@ function runtimeFor(state: TeamOrchestratorState): OrchestratorRuntime {
 }
 
 function getCoordinator(team: TeamConfig): TeamMember | undefined {
-  return team.members.find((member) => member.role === "planner")
-    ?? team.members.find((member) => member.role === "lead")
-    ?? team.members[0];
+  return getCoordinatorMember(team);
 }
 
 function getMember(team: TeamConfig, name: string): TeamMember | undefined {
@@ -91,7 +96,7 @@ function getMember(team: TeamConfig, name: string): TeamMember | undefined {
 }
 
 function getRoleExecutionGuidance(role: TeamMember["role"]): string {
-  switch (role) {
+  switch (normalizeTeamRole(role)) {
     case "coder":
       return "You are the implementation owner. Create or modify files only when a delegated task explicitly allows edits.";
     case "reviewer":
@@ -100,6 +105,14 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
       return "You are the planner. Coordinate work and delegate bounded tasks through OV_DELEGATE.";
     case "lead":
       return "You are the lead. Coordinate, delegate, unblock, and provide final user-facing answers.";
+    case "scribe":
+      return "You are the scribe. Capture decisions, summarize delegated work, and provide compact written synthesis.";
+    case "tester":
+      return "You are the tester. Validate behavior, run focused checks when useful, and report pass/fail status and risks.";
+    case "visual":
+      return "You are the visual specialist. Focus on UI quality, interaction details, and visible regressions.";
+    case "visual_reviewer":
+      return "You are the visual reviewer. Review UI changes for layout, clarity, polish, and visible regressions.";
     default:
       return "";
   }
@@ -332,6 +345,35 @@ function synthesizeResultBlock(status: DelegationResult["status"], summary: stri
   ].join("\n");
 }
 
+function summarizeText(text: string, max = 260): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  return normalized.length > max ? `${normalized.slice(0, max - 3)}...` : normalized;
+}
+
+function resultSummary(resultBlock: string): string {
+  const match = resultBlock.match(/summary:\s*([\s\S]*?)(?:\n[a-z_]+:|<\/OV_RESULT>)/i);
+  return summarizeText(match?.[1] ?? resultBlock);
+}
+
+function eventMember(member: TeamMember): Pick<import("./orchestratorRunStore.js").OrchestratorRunEvent, "memberName" | "role" | "tool" | "model"> {
+  return {
+    memberName: member.name,
+    role: normalizeTeamRole(member.role),
+    tool: member.tool,
+    model: member.model,
+  };
+}
+
+export function getTeamOrchestratorStatus(): { available: boolean; enabled: boolean; provider: "langgraph"; runStore: boolean } {
+  return {
+    available: true,
+    enabled: true,
+    provider: "langgraph",
+    runStore: true,
+  };
+}
+
 async function leadTurn(state: TeamOrchestratorState): Promise<Partial<TeamOrchestratorState>> {
   const runtime = runtimeFor(state);
   const lead = getCoordinator(runtime.team);
@@ -343,11 +385,27 @@ async function leadTurn(state: TeamOrchestratorState): Promise<Partial<TeamOrche
   }
 
   log(`team.orchestrator.lead team=${runtime.team.id} lead=${lead.name} cycle=${state.cycles}`);
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_turn_started",
+    ...eventMember(lead),
+    status: "started",
+    summary: state.cycles === 0 ? "Initial lead turn started." : "Lead turn started.",
+  });
+  const startedAt = Date.now();
   const completion = await runtime.invokeMember(
     lead,
     buildLeadInitialPrompt(runtime.team, lead, runtime.userText, runtime.summarizePlan, runtime.summarizeBoard),
   );
   const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_turn_completed",
+    ...eventMember(lead),
+    status: completion.status === "idle" ? "completed" : "failed",
+    durationMs: Date.now() - startedAt,
+    summary: response || `Lead turn ended with status ${completion.status}.`,
+  });
   if (completion.status !== "idle") {
     return {
       leadName: lead.name,
@@ -366,11 +424,27 @@ async function leadRepairTurn(state: TeamOrchestratorState): Promise<Partial<Tea
   }
 
   log(`team.orchestrator.error team=${runtime.team.id} reason=invalid_delegate repair=1`);
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_turn_started",
+    ...eventMember(lead),
+    status: "started",
+    summary: "Lead repair turn started after invalid delegation output.",
+  });
+  const startedAt = Date.now();
   const completion = await runtime.invokeMember(
     lead,
     buildRepairPrompt(state.parseError ?? "Invalid OV_DELEGATE JSON", state.lastLeadResponse ?? ""),
   );
   const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_turn_completed",
+    ...eventMember(lead),
+    status: completion.status === "idle" ? "completed" : "failed",
+    durationMs: Date.now() - startedAt,
+    summary: response || `Lead repair ended with status ${completion.status}.`,
+  });
   return {
     lastLeadResponse: response || state.lastLeadResponse,
     invalidDelegationAttempts: state.invalidDelegationAttempts + 1,
@@ -418,25 +492,60 @@ async function runDelegations(state: TeamOrchestratorState): Promise<Partial<Tea
   for (const task of tasks) {
     log(`team.orchestrator.delegate team=${runtime.team.id} to=${task.to}`);
     const member = getMember(runtime.team, task.to);
+    appendOrchestratorEvent(state.runId, {
+      teamId: runtime.team.id,
+      type: "delegation_created",
+      memberName: task.to,
+      role: member ? normalizeTeamRole(member.role) : undefined,
+      tool: member?.tool,
+      model: member?.model,
+      status: "started",
+      summary: task.expected_summary || task.task,
+    });
     if (!member) {
-      results.push(blockedResult(task.to, task.task, `Unknown team member: ${task.to}`));
+      const result = blockedResult(task.to, task.task, `Unknown team member: ${task.to}`);
+      results.push(result);
+      appendOrchestratorEvent(state.runId, {
+        teamId: runtime.team.id,
+        type: "member_turn_completed",
+        memberName: task.to,
+        status: "blocked",
+        summary: resultSummary(result.resultBlock),
+      });
       continue;
     }
 
+    appendOrchestratorEvent(state.runId, {
+      teamId: runtime.team.id,
+      type: "member_turn_started",
+      ...eventMember(member),
+      status: "started",
+      summary: task.expected_summary || task.task,
+    });
+    const startedAt = Date.now();
     const completion = await runtime.invokeMember(member, buildDelegatedTaskPrompt(runtime.team, member, task));
     const raw = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
     if (completion.status !== "idle") {
       const status = raw.toLowerCase().includes("already running") || raw.toLowerCase().includes(" is running")
         ? "blocked"
         : "failed";
-      results.push(status === "blocked"
+      const result = status === "blocked"
         ? blockedResult(task.to, task.task, raw || `Session for ${task.to} is busy`)
-        : failedResult(task.to, task.task, raw || `${task.to} failed with status ${completion.status}`));
+        : failedResult(task.to, task.task, raw || `${task.to} failed with status ${completion.status}`);
+      results.push(result);
+      appendOrchestratorEvent(state.runId, {
+        teamId: runtime.team.id,
+        type: "member_turn_completed",
+        ...eventMember(member),
+        status,
+        durationMs: Date.now() - startedAt,
+        summary: resultSummary(result.resultBlock),
+      });
       continue;
     }
 
     const resultBlock = parseResultBlock(raw) ?? synthesizeResultBlock("completed", raw);
-    results.push({
+    const result: DelegationResult = {
       to: task.to,
       task: task.task,
       status: resultBlock.toLowerCase().includes("status: failed")
@@ -446,6 +555,15 @@ async function runDelegations(state: TeamOrchestratorState): Promise<Partial<Tea
           : "completed",
       resultBlock,
       fullResponse: raw,
+    };
+    results.push(result);
+    appendOrchestratorEvent(state.runId, {
+      teamId: runtime.team.id,
+      type: "member_turn_completed",
+      ...eventMember(member),
+      status: result.status,
+      durationMs: Date.now() - startedAt,
+      summary: resultSummary(result.resultBlock),
     });
     log(`team.orchestrator.result team=${runtime.team.id} from=${task.to}`);
   }
@@ -465,8 +583,24 @@ async function leadReviewTurn(state: TeamOrchestratorState): Promise<Partial<Tea
   }
 
   log(`team.orchestrator.lead team=${runtime.team.id} lead=${lead.name} reviewCycle=${state.cycles}`);
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_review_started",
+    ...eventMember(lead),
+    status: "started",
+    summary: "Lead review started after delegated member results.",
+  });
+  const startedAt = Date.now();
   const completion = await runtime.invokeMember(lead, buildLeadReviewPrompt(state.results ?? []));
   const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_turn_completed",
+    ...eventMember(lead),
+    status: completion.status === "idle" ? "completed" : "failed",
+    durationMs: Date.now() - startedAt,
+    summary: response || `Lead review ended with status ${completion.status}.`,
+  });
   if (completion.status !== "idle") {
     return {
       decision: "fallback",
@@ -484,8 +618,31 @@ async function forceFinal(state: TeamOrchestratorState): Promise<Partial<TeamOrc
   }
 
   log(`team.orchestrator.error team=${runtime.team.id} reason=max_cycles`);
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "orchestrator_error",
+    ...eventMember(lead),
+    status: "blocked",
+    summary: `Reached maxCycles=${MAX_CYCLES}.`,
+  });
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_turn_started",
+    ...eventMember(lead),
+    status: "started",
+    summary: "Forced final lead turn started.",
+  });
+  const startedAt = Date.now();
   const completion = await runtime.invokeMember(lead, buildForceFinalPrompt());
   const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  appendOrchestratorEvent(state.runId, {
+    teamId: runtime.team.id,
+    type: "lead_turn_completed",
+    ...eventMember(lead),
+    status: completion.status === "idle" ? "completed" : "failed",
+    durationMs: Date.now() - startedAt,
+    summary: response || `Forced final lead turn ended with status ${completion.status}.`,
+  });
   const finalText = parseFinalBlock(response);
   if (finalText) {
     return { finalText, decision: "final" };
@@ -539,6 +696,17 @@ export async function runTeamOrchestrator(input: RunTeamOrchestratorInput): Prom
   const lead = getCoordinator(input.team);
   const runId = `team_orch_${Date.now()}_${++runCounter}`;
   runtimes.set(runId, input);
+  startOrchestratorRun({ runId, teamId: input.team.id, leadName: lead?.name });
+  appendOrchestratorEvent(runId, {
+    teamId: input.team.id,
+    type: "orchestrator_start",
+    memberName: lead?.name,
+    role: lead ? normalizeTeamRole(lead.role) : undefined,
+    tool: lead?.tool,
+    model: lead?.model,
+    status: "started",
+    summary: `Team orchestrator started for ${input.team.name}.`,
+  });
   log(`team.orchestrator.start team=${input.team.id} lead=${lead?.name ?? "none"}`);
 
   try {
@@ -554,16 +722,57 @@ export async function runTeamOrchestrator(input: RunTeamOrchestratorInput): Prom
     const finalText = finalState.finalText ?? finalState.fallbackText;
     if (!finalText) {
       log(`team.orchestrator.error team=${input.team.id} reason=no_final`);
-      input.writeFinalMessage(lead?.name ?? "Lead", "Team orchestration ended without a final answer.");
+      appendOrchestratorEvent(runId, {
+        teamId: input.team.id,
+        type: "orchestrator_error",
+        memberName: lead?.name,
+        role: lead ? normalizeTeamRole(lead.role) : undefined,
+        tool: lead?.tool,
+        model: lead?.model,
+        status: "failed",
+        summary: "Team orchestration ended without a final answer.",
+      });
+      finishOrchestratorRun(runId, "failed", "Team orchestration ended without a final answer.");
+      input.writeFinalMessage(
+        lead?.name ?? "Lead",
+        "Team orchestration ended without a final answer.",
+        createMessageOrchestration(runId),
+      );
       return;
     }
 
     log(`team.orchestrator.final team=${input.team.id} lead=${lead?.name ?? "Lead"}`);
-    input.writeFinalMessage(lead?.name ?? "Lead", finalText);
+    appendOrchestratorEvent(runId, {
+      teamId: input.team.id,
+      type: "final_created",
+      memberName: lead?.name ?? "Lead",
+      role: lead ? normalizeTeamRole(lead.role) : "lead",
+      tool: lead?.tool,
+      model: lead?.model,
+      status: finalState.fallbackText && !finalState.finalText ? "blocked" : "completed",
+      summary: finalText,
+    });
+    finishOrchestratorRun(
+      runId,
+      finalState.fallbackText && !finalState.finalText ? "blocked" : "completed",
+      finalText,
+    );
+    input.writeFinalMessage(lead?.name ?? "Lead", finalText, createMessageOrchestration(runId));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`team.orchestrator.error team=${input.team.id} reason=exception error=${message}`);
-    input.writeFinalMessage(lead?.name ?? "Lead", `Team orchestration failed: ${message}`);
+    appendOrchestratorEvent(runId, {
+      teamId: input.team.id,
+      type: "orchestrator_error",
+      memberName: lead?.name,
+      role: lead ? normalizeTeamRole(lead.role) : undefined,
+      tool: lead?.tool,
+      model: lead?.model,
+      status: "failed",
+      summary: message,
+    });
+    finishOrchestratorRun(runId, "failed", message);
+    input.writeFinalMessage(lead?.name ?? "Lead", `Team orchestration failed: ${message}`, createMessageOrchestration(runId));
   } finally {
     runtimes.delete(runId);
   }

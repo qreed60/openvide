@@ -15,6 +15,8 @@ import { detectTailscaleIp, detectTailscaleHostname, getTailscaleTls } from "./c
 import { encodeQR } from "./qrText.js";
 import * as tm from "./teamManager.js";
 import * as sched from "./scheduleManager.js";
+import { getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
+import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
 
 const SOCKET_NAME = "daemon.sock";
 
@@ -147,6 +149,7 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
         activeSessions: sm.getActiveCount(),
         totalSessions: sessions.length,
         tools,
+        orchestrator: getTeamOrchestratorStatus(),
       };
     }
 
@@ -803,6 +806,20 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       if (!teamId) return { ok: false, error: "Missing required: teamId" };
       const limit = typeof req.limit === "number" ? req.limit : undefined;
       return { ok: true, teamMessages: tm.listMessages(teamId, limit) };
+    }
+
+    case "team.orchestrator.runs.list": {
+      const limit = typeof req.limit === "number" ? req.limit : 20;
+      const teamId = typeof req.teamId === "string" ? req.teamId : undefined;
+      return { ok: true, orchestratorRuns: listRecentOrchestratorRuns(limit, teamId) };
+    }
+
+    case "team.orchestrator.run.get": {
+      const runId = req.runId as string | undefined;
+      if (!runId) return { ok: false, error: "Missing required: runId" };
+      const run = getOrchestratorRun(runId);
+      if (!run) return { ok: false, error: `Orchestrator run ${runId} not found` };
+      return { ok: true, orchestratorRun: run };
     }
 
     case "team.plan.submit": {

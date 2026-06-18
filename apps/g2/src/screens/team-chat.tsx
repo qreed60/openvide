@@ -14,6 +14,22 @@ interface TeamMessageSummary {
   to: string;
   text: string;
   createdAt: string;
+  orchestration?: {
+    runId: string;
+    teamId: string;
+    status: 'completed' | 'blocked' | 'failed';
+    route: string[];
+    routeSummary: string;
+    timeline: Array<{
+      memberName?: string;
+      role?: string;
+      tool?: string;
+      model?: string;
+      status?: 'started' | 'completed' | 'blocked' | 'failed';
+      durationMs?: number;
+      summary?: string;
+    }>;
+  };
 }
 
 function formatRecipient(to: string): string {
@@ -35,11 +51,70 @@ function sameMessages(a: TeamMessageSummary[], b: TeamMessageSummary[]): boolean
       || left.text !== right.text
       || left.createdAt !== right.createdAt
       || left.fromTool !== right.fromTool
+      || JSON.stringify(left.orchestration ?? null) !== JSON.stringify(right.orchestration ?? null)
     ) {
       return false;
     }
   }
   return true;
+}
+
+function formatDuration(durationMs?: number): string {
+  if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 0) return '';
+  if (durationMs < 1000) return `${durationMs}ms`;
+  return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
+}
+
+function statusClass(status?: string): string {
+  if (status === 'failed') return 'border-red-500/30 bg-red-500/10 text-red-300';
+  if (status === 'blocked') return 'border-amber-500/30 bg-amber-500/10 text-amber-300';
+  return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300';
+}
+
+function OrchestrationDetails({ orchestration }: { orchestration: NonNullable<TeamMessageSummary['orchestration']> }) {
+  const routeSummary = orchestration.route.length > 0
+    ? orchestration.route.join(' \u2192 ')
+    : orchestration.routeSummary.replace(/ -> /g, ' \u2192 ');
+
+  return (
+    <div className="mt-2 w-full rounded-[6px] border border-border bg-bg/40 px-3 py-2 text-[12px] tracking-[-0.12px] text-text-dim">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="data-mono text-text">{routeSummary || 'Team orchestration'}</span>
+        <span className={`rounded-[4px] border px-1.5 py-0.5 data-mono uppercase ${statusClass(orchestration.status)}`}>
+          {orchestration.status}
+        </span>
+      </div>
+      {orchestration.timeline.length > 0 && (
+        <details className="mt-2">
+          <summary className="cursor-pointer select-none data-mono text-text-dim">Timeline</summary>
+          <div className="mt-2 flex flex-col gap-1.5">
+            {orchestration.timeline.map((event, index) => (
+              <div key={`${event.memberName ?? 'member'}-${index}`} className="rounded-[6px] border border-border/70 bg-surface/60 px-2 py-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="data-mono text-text">{event.memberName ?? 'Member'}</span>
+                  {event.role && <span>{event.role}</span>}
+                  {(event.tool || event.model) && (
+                    <span className="text-text-dim">
+                      {event.tool ?? 'provider'}{event.model ? ` / ${event.model}` : ''}
+                    </span>
+                  )}
+                  {event.durationMs != null && <span>{formatDuration(event.durationMs)}</span>}
+                  {event.status && (
+                    <span className={`rounded-[4px] border px-1.5 py-0.5 data-mono uppercase ${statusClass(event.status)}`}>
+                      {event.status}
+                    </span>
+                  )}
+                </div>
+                {event.summary && (
+                  <div className="mt-1 line-clamp-2 text-text-dim">{event.summary}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  );
 }
 
 export function TeamChatRoute() {
@@ -160,6 +235,9 @@ export function TeamChatRoute() {
               >
                 {msg.text}
               </ChatBubble>
+              {!isUser && msg.orchestration && (
+                <OrchestrationDetails orchestration={msg.orchestration} />
+              )}
             </div>
           );
         })}
