@@ -1,7 +1,8 @@
-import type { Tool } from "./types.js";
+import { isExecutableAgentProvider, listProviderRegistryEntries } from "./agentProviders.js";
+import type { AgentProvider, ProviderCapabilities, ProviderStatus } from "./agentProviders.js";
 
-export type TeamProviderId = Tool | "opencode" | "openhands";
-export type TeamProviderStatus = "enabled" | "planned" | "disabled" | "unavailable";
+export type TeamProviderId = AgentProvider;
+export type TeamProviderStatus = ProviderStatus;
 
 export interface TeamRoleMetadata {
   id: string;
@@ -12,14 +13,7 @@ export interface TeamRoleMetadata {
   defaultReadOnly: boolean;
 }
 
-export interface TeamProviderCapabilities {
-  canEdit: boolean;
-  canReview: boolean;
-  supportsVision: boolean;
-  supportsLongRunning: boolean;
-  supportsStatusPolling: boolean;
-  supportsModelOverride: boolean;
-}
+export interface TeamProviderCapabilities extends ProviderCapabilities {}
 
 export interface TeamProviderMetadata {
   id: TeamProviderId;
@@ -49,80 +43,11 @@ export const SUPPORTED_TEAM_ROLES: TeamRoleMetadata[] = [
   { id: "domain_specialist", label: "Domain Specialist", aliases: [], canEdit: false, canReview: true, defaultReadOnly: true },
 ];
 
-export function isExecutableTeamTool(tool: string | undefined): tool is Tool {
-  return tool === "claude" || tool === "codex" || tool === "gemini";
-}
-
-function executableProvider(id: Tool, label: string, available: boolean, capabilities: Omit<TeamProviderCapabilities, "supportsModelOverride">): TeamProviderMetadata {
-  return {
-    id,
-    label,
-    status: available ? "enabled" : "unavailable",
-    available,
-    enabled: available,
-    planned: false,
-    modelOverride: true,
-    capabilities: {
-      ...capabilities,
-      supportsModelOverride: true,
-    },
-  };
-}
-
-function plannedProvider(id: "opencode" | "openhands", label: string, capabilities: TeamProviderCapabilities): TeamProviderMetadata {
-  return {
-    id,
-    label,
-    status: "planned",
-    available: false,
-    enabled: false,
-    planned: true,
-    modelOverride: false,
-    capabilities,
-  };
-}
+export const isExecutableTeamTool = isExecutableAgentProvider;
 
 export function getTeamMetadata(installedTools: Record<string, boolean>): TeamMetadata {
   return {
     roles: SUPPORTED_TEAM_ROLES,
-    providers: [
-      executableProvider("claude", "Claude", installedTools.claude === true, {
-        canEdit: true,
-        canReview: true,
-        supportsVision: true,
-        supportsLongRunning: false,
-        supportsStatusPolling: true,
-      }),
-      executableProvider("codex", "Codex", installedTools.codex === true, {
-        canEdit: true,
-        canReview: true,
-        supportsVision: false,
-        supportsLongRunning: false,
-        supportsStatusPolling: true,
-      }),
-      executableProvider("gemini", "Gemini", installedTools.gemini === true, {
-        canEdit: true,
-        canReview: true,
-        supportsVision: true,
-        supportsLongRunning: false,
-        supportsStatusPolling: true,
-      }),
-      plannedProvider("opencode", "OpenCode", {
-        canEdit: true,
-        canReview: true,
-        supportsVision: false,
-        supportsLongRunning: false,
-        supportsStatusPolling: false,
-        supportsModelOverride: false,
-      }),
-      plannedProvider("openhands", "OpenHands", {
-        canEdit: true,
-        canReview: false,
-        supportsVision: false,
-        supportsLongRunning: true,
-        supportsStatusPolling: false,
-        supportsModelOverride: false,
-      }),
-    ],
+    providers: listProviderRegistryEntries(installedTools),
   };
 }

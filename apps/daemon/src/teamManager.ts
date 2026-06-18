@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { daemonDir, newId, nowISO, log, logError } from "./utils.js";
 import * as sm from "./sessionManager.js";
 import { runTeamOrchestrator } from "./teamOrchestrator.js";
+import { executeProviderTurn } from "./agentProviders.js";
 import { isExecutableTeamTool } from "./teamMetadata.js";
 import { getCoordinatorMember, normalizeTeamRole, roleMatches } from "./teamRoles.js";
 import type {
@@ -407,11 +408,7 @@ function autoStartTask(teamId: string, task: TeamTask): void {
   ].join("\n");
 
   try {
-    const res = sm.sendTurn(member.sessionId, prompt);
-    if (!res.ok) {
-      throw new Error(res.error ?? `Failed to start task ${task.id}`);
-    }
-    watchSessionResponse(member.sessionId, (result) => {
+    void invokeMemberTurn(member, prompt).then((result) => {
       const latest = getTask(teamId, task.id);
       if (!latest) return;
 
@@ -435,6 +432,8 @@ function autoStartTask(teamId: string, task: TeamTask): void {
         text: summary.slice(0, 2000),
       });
       updateTask(teamId, latest.id, { status: "review" });
+    }).catch((err: unknown) => {
+      log(`[team] Failed to start task for ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
     });
   } catch (err) {
     log(`[team] Failed to start task for ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -461,9 +460,7 @@ function sendTaskToReviewer(team: TeamConfig, reviewer: TeamMember, task: TeamTa
   ].join("\n");
 
   try {
-    const result = sm.sendTurn(reviewer.sessionId, prompt);
-    if (!result.ok) throw new Error(result.error ?? `Failed to send review for ${task.id}`);
-    watchSessionResponse(reviewer.sessionId, (result) => {
+    void invokeMemberTurn(reviewer, prompt).then((result) => {
       const latest = getTask(team.id, task.id);
       if (!latest) return;
 
@@ -495,6 +492,8 @@ function sendTaskToReviewer(team: TeamConfig, reviewer: TeamMember, task: TeamTa
       }
 
       updateTask(team.id, latest.id, { status: "approved" });
+    }).catch((err: unknown) => {
+      log(`[team] Failed to send review to ${reviewer.name}: ${err instanceof Error ? err.message : String(err)}`);
     });
     log(`Auto-sent review request to ${reviewer.name} for task ${task.id}`);
   } catch (err) {
@@ -786,17 +785,6 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
 }
 
 function invokeMemberTurn(member: TeamMember, prompt: string): Promise<SessionCompletion> {
-  const session = sm.getSession(member.sessionId);
-  if (!session || session.status !== "idle") {
-    return Promise.resolve({
-      status: "failed",
-      responseText: "",
-      errorText: session
-        ? `Session ${member.sessionId} for ${member.name} is ${session.status}`
-        : `Session ${member.sessionId} for ${member.name} was not found`,
-    });
-  }
-
   if (activeWatchers.has(member.sessionId)) {
     return Promise.resolve({
       status: "failed",
@@ -806,13 +794,16 @@ function invokeMemberTurn(member: TeamMember, prompt: string): Promise<SessionCo
   }
 
   try {
-    const result = sm.sendTurn(member.sessionId, prompt);
-    if (!result.ok) {
-      throw new Error(result.error ?? `Failed to send team chat turn to ${member.name}`);
-    }
-
-    return new Promise((resolve) => {
-      watchSessionResponse(member.sessionId, resolve);
+    return executeProviderTurn({
+      member,
+      prompt,
+      waitForCompletion: waitForSessionCompletion,
+    }).then((result) => {
+      return {
+        status: result.status,
+        responseText: result.responseText,
+        errorText: result.errorText ?? result.error,
+      };
     });
   } catch (err) {
     log(`[team] Failed to inject message to ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -859,6 +850,12 @@ type SessionCompletion = {
 };
 
 const activeWatchers = new Map<string, (result: SessionCompletion) => void>();
+
+function waitForSessionCompletion(sessionId: string): Promise<SessionCompletion> {
+  return new Promise((resolve) => {
+    watchSessionResponse(sessionId, resolve);
+  });
+}
 
 /** Poll a session until it goes idle, then capture the last turn response. */
 function watchSessionResponse(sessionId: string, onComplete: (result: SessionCompletion) => void): void {
@@ -1044,12 +1041,7 @@ export function generatePlan(
     text: request,
   });
 
-  const result = sm.sendTurn(planner.sessionId, buildPlanGenerationPrompt(team, request));
-  if (!result.ok) {
-    throw new Error(result.error ?? `Failed to generate plan for ${teamId}`);
-  }
-
-  watchSessionResponse(planner.sessionId, (result) => {
+  void invokeMemberTurn(planner, buildPlanGenerationPrompt(team, request)).then((result) => {
     if (result.status !== "idle") {
       writeTeamMessage(teamId, {
         from: planner.name,
@@ -1073,6 +1065,12 @@ export function generatePlan(
         text: `Plan generation failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
       });
     }
+  }).catch((err: unknown) => {
+    writeTeamMessage(teamId, {
+      from: planner.name,
+      to: "team",
+      text: `Plan generation failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
+    });
   });
 
   log(`Plan generation requested for team ${teamId} via ${planner.name}`);
@@ -1339,9 +1337,7 @@ function sendToReviewer(team: TeamConfig, reviewerName: string, prompt: string):
   const member = team.members.find((m) => m.name === reviewerName);
   if (member) {
     try {
-      const result = sm.sendTurn(member.sessionId, prompt);
-      if (!result.ok) throw new Error(result.error ?? `Failed to send to ${reviewerName}`);
-      watchSessionResponse(member.sessionId, (result) => {
+      void invokeMemberTurn(member, prompt).then((result) => {
         const latestPlan = getLatestPlan(team.id);
         if (!latestPlan || latestPlan.status !== "review") return;
         if (result.status !== "idle") {
@@ -1367,6 +1363,12 @@ function sendToReviewer(team: TeamConfig, reviewerName: string, prompt: string):
           text: `${decision.decision.toUpperCase()} ${latestPlan.id}${decision.feedback ? ` — ${decision.feedback}` : ""}`.slice(0, 2000),
         });
         reviewPlan(team.id, latestPlan.id, reviewerName, decision.decision, decision.feedback);
+      }).catch((err: unknown) => {
+        writeTeamMessage(team.id, {
+          from: reviewerName,
+          to: "team",
+          text: `Plan review failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
+        });
       });
     } catch {
       log(`[team] Failed to send to reviewer ${reviewerName}`);
@@ -1393,9 +1395,7 @@ ${feedbackList}
 Please submit a revised plan addressing this feedback.`;
 
   try {
-    const result = sm.sendTurn(planner.sessionId, prompt);
-    if (!result.ok) throw new Error(result.error ?? `Failed to send revision request to ${planner.name}`);
-    watchSessionResponse(planner.sessionId, (result) => {
+    void invokeMemberTurn(planner, prompt).then((result) => {
       if (result.status !== "idle") {
         writeTeamMessage(team.id, {
           from: planner.name,
@@ -1419,6 +1419,12 @@ Please submit a revised plan addressing this feedback.`;
           text: `Revision for ${plan.id} could not be parsed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
         });
       }
+    }).catch((err: unknown) => {
+      writeTeamMessage(team.id, {
+        from: planner.name,
+        to: "team",
+        text: `Revision for ${plan.id} failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
+      });
     });
   } catch {
     log(`[team] Failed to send to planner ${planner.name}`);
