@@ -118,7 +118,7 @@ function snapshotBridgeConfig(config: BridgeConfig): BridgeConfigSnapshot {
   };
 }
 
-const DETECTABLE_TOOLS = ["claude", "codex", "gemini", "opencode"];
+const DETECTABLE_TOOLS = ["claude", "codex", "gemini", "opencode", "openhands"];
 
 function firstLines(text: string, maxLines: number, maxChars: number): string | undefined {
   const lines = text
@@ -166,6 +166,30 @@ async function detectOpenCode(command: string): Promise<ProviderDetectionInfo> {
   return detection;
 }
 
+function openHandsVersionSummary(text: string): string | undefined {
+  const versions = text
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .map((line) => line.replace(/^\|\s*/, "").replace(/\s*\|$/, "").trim())
+    .filter((line) => /^OpenHands (SDK|CLI)\b/.test(line));
+  return firstLines(versions.join("\n"), 2, 200);
+}
+
+async function detectOpenHands(command: string): Promise<ProviderDetectionInfo> {
+  const detection: ProviderDetectionInfo = { available: true, command };
+  const version = await execFileBounded(command, ["--version"], 7000);
+  const versionText = `${version.stdout}\n${version.stderr}`;
+  detection.version = openHandsVersionSummary(versionText) ?? firstLines(versionText, 2, 200);
+
+  const help = await execFileBounded(command, ["--help"], 7000);
+  detection.helpSummary = firstLines(help.stdout, 12, 1200) ?? firstLines(help.stderr, 12, 1200);
+  if (!version.ok && !help.ok && !detection.version && !detection.helpSummary) {
+    detection.error = help.error ?? version.error;
+  }
+  return detection;
+}
+
 /** Check which CLI tools are installed on this host. */
 async function detectInstalledTools(): Promise<Record<string, ProviderDetectionInfo>> {
   const results: Record<string, ProviderDetectionInfo> = {};
@@ -177,9 +201,15 @@ async function detectInstalledTools(): Promise<Record<string, ProviderDetectionI
           results[tool] = { available: false };
           return;
         }
-        results[tool] = tool === "opencode"
-          ? await detectOpenCode(command)
-          : { available: true, command };
+        if (tool === "opencode") {
+          results[tool] = await detectOpenCode(command);
+          return;
+        }
+        if (tool === "openhands") {
+          results[tool] = await detectOpenHands(command);
+          return;
+        }
+        results[tool] = { available: true, command };
       } catch {
         results[tool] = { available: false };
       }

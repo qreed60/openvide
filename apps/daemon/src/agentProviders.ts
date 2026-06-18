@@ -169,10 +169,10 @@ const plannedProviders: ProviderRegistryEntry[] = [
     planned: true,
     modelOverride: false,
     capabilities: {
-      canEdit: true,
+      canEdit: false,
       canReview: false,
       supportsVision: false,
-      supportsLongRunning: true,
+      supportsLongRunning: false,
       supportsStatusPolling: false,
       supportsModelOverride: false,
     },
