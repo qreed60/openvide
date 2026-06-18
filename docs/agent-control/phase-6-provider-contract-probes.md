@@ -61,7 +61,7 @@ Exit/stdout/stderr behavior:
 File behavior:
 
 - The bounded help/version probes did not change tracked files in `/tmp/provider-contract-probes/opencode`.
-- Actual model-backed `opencode run ...` execution was not run by this phase.
+- Actual model-backed `opencode run ...` execution was not run by this phase. Phase 7 documents the later real model-backed OpenCode probe.
 
 Execution readiness:
 
@@ -107,7 +107,7 @@ Exit/stdout/stderr behavior:
 File behavior:
 
 - The bounded help/version probes did not change tracked files in `/tmp/provider-contract-probes/openhands`.
-- Actual model-backed `openhands --headless --json -t ...` execution was not run by this phase.
+- Actual model-backed `openhands --headless --json -t ...` execution was not run by this phase. Phase 7 documents the later real model-backed OpenHands probe.
 
 Execution readiness:
 
