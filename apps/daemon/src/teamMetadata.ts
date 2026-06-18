@@ -1,5 +1,5 @@
 import { isExecutableAgentProvider, listProviderRegistryEntries } from "./agentProviders.js";
-import type { AgentProvider, ProviderCapabilities, ProviderStatus } from "./agentProviders.js";
+import type { AgentProvider, ProviderCapabilities, ProviderDetectionInfo, ProviderStatus } from "./agentProviders.js";
 
 export type TeamProviderId = AgentProvider;
 export type TeamProviderStatus = ProviderStatus;
@@ -18,12 +18,15 @@ export interface TeamProviderCapabilities extends ProviderCapabilities {}
 export interface TeamProviderMetadata {
   id: TeamProviderId;
   label: string;
+  type: "cli" | "planned";
   status: TeamProviderStatus;
   available: boolean;
   enabled: boolean;
+  executable: boolean;
   planned: boolean;
   modelOverride: boolean;
   capabilities: TeamProviderCapabilities;
+  detection?: ProviderDetectionInfo;
 }
 
 export interface TeamMetadata {
@@ -45,7 +48,7 @@ export const SUPPORTED_TEAM_ROLES: TeamRoleMetadata[] = [
 
 export const isExecutableTeamTool = isExecutableAgentProvider;
 
-export function getTeamMetadata(installedTools: Record<string, boolean>): TeamMetadata {
+export function getTeamMetadata(installedTools: Record<string, boolean | ProviderDetectionInfo>): TeamMetadata {
   return {
     roles: SUPPORTED_TEAM_ROLES,
     providers: listProviderRegistryEntries(installedTools),

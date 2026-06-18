@@ -18,6 +18,7 @@ import * as sched from "./scheduleManager.js";
 import { detailOrchestratorRun, getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
 import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
 import { getTeamMetadata } from "./teamMetadata.js";
+import type { ProviderDetectionInfo } from "./agentProviders.js";
 
 const SOCKET_NAME = "daemon.sock";
 
@@ -117,25 +118,78 @@ function snapshotBridgeConfig(config: BridgeConfig): BridgeConfigSnapshot {
   };
 }
 
+const DETECTABLE_TOOLS = ["claude", "codex", "gemini", "opencode"];
+
+function firstLines(text: string, maxLines: number, maxChars: number): string | undefined {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, maxLines);
+  const summary = lines.join("\n").slice(0, maxChars).trim();
+  return summary || undefined;
+}
+
+async function execFileBounded(
+  command: string,
+  args: string[],
+  timeout = 2000,
+): Promise<{ ok: boolean; stdout: string; stderr: string; error?: string }> {
+  return new Promise((resolve) => {
+    child_process.execFile(command, args, { timeout, maxBuffer: 8192 }, (err, stdout, stderr) => {
+      resolve({
+        ok: !err,
+        stdout: stdout.toString(),
+        stderr: stderr.toString(),
+        error: err ? (err instanceof Error ? err.message : String(err)) : undefined,
+      });
+    });
+  });
+}
+
+async function detectCommand(tool: string): Promise<string | undefined> {
+  if (!/^[a-z][a-z0-9_-]*$/i.test(tool)) return undefined;
+  const result = await execFileBounded("sh", ["-lc", `command -v ${tool}`], 1500);
+  return result.ok ? firstLines(result.stdout, 1, 500) : undefined;
+}
+
+async function detectOpenCode(command: string): Promise<ProviderDetectionInfo> {
+  const detection: ProviderDetectionInfo = { available: true, command };
+  const version = await execFileBounded(command, ["--version"], 1500);
+  detection.version = firstLines(`${version.stdout}\n${version.stderr}`, 1, 200);
+
+  const help = await execFileBounded(command, ["--help"], 1500);
+  detection.helpSummary = firstLines(`${help.stdout}\n${help.stderr}`, 8, 1000);
+  if (!version.ok && !help.ok && !detection.version && !detection.helpSummary) {
+    detection.error = help.error ?? version.error;
+  }
+  return detection;
+}
+
 /** Check which CLI tools are installed on this host. */
-async function detectInstalledTools(): Promise<Record<string, boolean>> {
-  const tools = ["claude", "codex", "gemini"];
-  const results: Record<string, boolean> = {};
+async function detectInstalledTools(): Promise<Record<string, ProviderDetectionInfo>> {
+  const results: Record<string, ProviderDetectionInfo> = {};
   await Promise.all(
-    tools.map(async (tool) => {
+    DETECTABLE_TOOLS.map(async (tool) => {
       try {
-        await new Promise<void>((resolve, reject) => {
-          child_process.exec(`command -v ${tool}`, { timeout: 3000 }, (err) => {
-            err ? reject(err) : resolve();
-          });
-        });
-        results[tool] = true;
+        const command = await detectCommand(tool);
+        if (!command) {
+          results[tool] = { available: false };
+          return;
+        }
+        results[tool] = tool === "opencode"
+          ? await detectOpenCode(command)
+          : { available: true, command };
       } catch {
-        results[tool] = false;
+        results[tool] = { available: false };
       }
     }),
   );
   return results;
+}
+
+function toolAvailabilityMap(tools: Record<string, ProviderDetectionInfo>): Record<string, boolean> {
+  return Object.fromEntries(Object.entries(tools).map(([tool, detection]) => [tool, detection.available === true]));
 }
 
 export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
@@ -149,7 +203,7 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
         name: os.hostname(),
         activeSessions: sm.getActiveCount(),
         totalSessions: sessions.length,
-        tools,
+        tools: toolAvailabilityMap(tools),
         orchestrator: getTeamOrchestratorStatus(),
       };
     }

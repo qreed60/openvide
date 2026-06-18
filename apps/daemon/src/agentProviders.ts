@@ -2,7 +2,7 @@ import * as sm from "./sessionManager.js";
 import type { IpcResponse, TeamMember, Tool } from "./types.js";
 
 export type AgentProvider = Tool | "opencode" | "openhands";
-export type ProviderStatus = "enabled" | "planned" | "disabled" | "unavailable";
+export type ProviderStatus = "enabled" | "planned" | "installed-but-not-executable" | "disabled" | "unavailable";
 
 export interface ProviderCapabilities {
   canEdit: boolean;
@@ -42,12 +42,23 @@ export interface ProviderAdapter {
 export interface ProviderRegistryEntry {
   id: AgentProvider;
   label: string;
+  type: "cli" | "planned";
   status: ProviderStatus;
   available: boolean;
   enabled: boolean;
+  executable: boolean;
   planned: boolean;
   modelOverride: boolean;
   capabilities: ProviderCapabilities;
+  detection?: ProviderDetectionInfo;
+}
+
+export interface ProviderDetectionInfo {
+  available: boolean;
+  command?: string;
+  version?: string;
+  helpSummary?: string;
+  error?: string;
 }
 
 const cliCapabilities = (overrides: Partial<ProviderCapabilities> = {}): ProviderCapabilities => ({
@@ -131,14 +142,16 @@ const plannedProviders: ProviderRegistryEntry[] = [
   {
     id: "opencode",
     label: "OpenCode",
+    type: "planned",
     status: "planned",
     available: false,
     enabled: false,
+    executable: false,
     planned: true,
     modelOverride: false,
     capabilities: {
-      canEdit: true,
-      canReview: true,
+      canEdit: false,
+      canReview: false,
       supportsVision: false,
       supportsLongRunning: false,
       supportsStatusPolling: false,
@@ -148,9 +161,11 @@ const plannedProviders: ProviderRegistryEntry[] = [
   {
     id: "openhands",
     label: "OpenHands",
+    type: "planned",
     status: "planned",
     available: false,
     enabled: false,
+    executable: false,
     planned: true,
     modelOverride: false,
     capabilities: {
@@ -173,22 +188,51 @@ export function isExecutableAgentProvider(provider: string | undefined): provide
   return getProviderAdapter(provider) !== undefined;
 }
 
-export function listProviderRegistryEntries(installedTools: Record<string, boolean>): ProviderRegistryEntry[] {
+function normalizeDetection(
+  installedTools: Record<string, boolean | ProviderDetectionInfo>,
+  provider: string,
+): ProviderDetectionInfo {
+  const detection = installedTools[provider];
+  if (typeof detection === "boolean") return { available: detection };
+  return detection ?? { available: false };
+}
+
+function plannedProviderEntry(
+  entry: ProviderRegistryEntry,
+  installedTools: Record<string, boolean | ProviderDetectionInfo>,
+): ProviderRegistryEntry {
+  const detection = normalizeDetection(installedTools, entry.id);
+  const available = detection.available === true;
+  return {
+    ...entry,
+    status: available ? "installed-but-not-executable" : entry.status,
+    available,
+    enabled: false,
+    executable: false,
+    detection,
+  };
+}
+
+export function listProviderRegistryEntries(installedTools: Record<string, boolean | ProviderDetectionInfo>): ProviderRegistryEntry[] {
   const executable = [...providerAdapters.values()].map((adapter) => {
-    const available = installedTools[adapter.provider] === true;
+    const detection = normalizeDetection(installedTools, adapter.provider);
+    const available = detection.available === true;
     return {
       id: adapter.provider,
       label: adapter.label,
+      type: "cli",
       status: available ? "enabled" : "unavailable",
       available,
       enabled: available,
+      executable: true,
       planned: false,
       modelOverride: adapter.capabilities.supportsModelOverride,
       capabilities: adapter.capabilities,
+      detection,
     } satisfies ProviderRegistryEntry;
   });
 
-  return [...executable, ...plannedProviders];
+  return [...executable, ...plannedProviders.map((entry) => plannedProviderEntry(entry, installedTools))];
 }
 
 export async function executeProviderTurn(request: ProviderExecutionRequest): Promise<ProviderExecutionResult> {
