@@ -32,6 +32,45 @@ interface TeamMessageSummary {
   };
 }
 
+interface OrchestratorRunSummary {
+  runId: string;
+  teamId: string;
+  status: 'running' | 'completed' | 'blocked' | 'failed';
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  route: string[];
+  routeSummary: string;
+  eventCount: number;
+  summary?: string;
+}
+
+interface OrchestratorRunEventSummary {
+  id: string;
+  type: string;
+  timestamp: string;
+  memberName?: string;
+  role?: string;
+  tool?: string;
+  model?: string;
+  status?: 'started' | 'completed' | 'blocked' | 'failed';
+  durationMs?: number;
+  summary?: string;
+}
+
+interface OrchestratorRunDetails {
+  summary: OrchestratorRunSummary;
+  events: OrchestratorRunEventSummary[];
+  route: string[];
+  routeSummary: string;
+  members: Array<{
+    name: string;
+    role?: string;
+    tool?: string;
+    model?: string;
+  }>;
+}
+
 function formatRecipient(to: string): string {
   if (to === '*' || to === 'team') return 'team';
   if (to === 'user' || to === 'you') return 'you';
@@ -65,16 +104,47 @@ function formatDuration(durationMs?: number): string {
   return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
 }
 
+function formatAge(iso?: string): string {
+  if (!iso) return '';
+  const epoch = Date.parse(iso);
+  if (!Number.isFinite(epoch)) return '';
+  const seconds = Math.max(0, Math.floor((Date.now() - epoch) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 function statusClass(status?: string): string {
   if (status === 'failed') return 'border-red-500/30 bg-red-500/10 text-red-300';
   if (status === 'blocked') return 'border-amber-500/30 bg-amber-500/10 text-amber-300';
+  if (status === 'running' || status === 'started') return 'border-[#4285F4]/30 bg-[#4285F4]/10 text-[#8AB4F8]';
+  if (!status) return 'border-border bg-surface text-text-dim';
   return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300';
 }
 
+function eventBorderClass(event: { status?: string; memberName?: string }): string {
+  if (event.status === 'failed') return 'border-red-500/40 bg-red-500/10';
+  if (event.status === 'blocked' || !event.memberName) return 'border-amber-500/40 bg-amber-500/10';
+  return 'border-border/70 bg-surface/60';
+}
+
+function routeText(route: string[], routeSummary?: string): string {
+  if (route.length > 0) return route.join(' \u2192 ');
+  return (routeSummary ?? '').replace(/ -> /g, ' \u2192 ');
+}
+
+function providerModel(tool?: string, model?: string): string {
+  if (!tool && !model) return '';
+  if (!model) return tool ?? '';
+  if (!tool) return model;
+  return `${tool} / ${model}`;
+}
+
 function OrchestrationDetails({ orchestration }: { orchestration: NonNullable<TeamMessageSummary['orchestration']> }) {
-  const routeSummary = orchestration.route.length > 0
-    ? orchestration.route.join(' \u2192 ')
-    : orchestration.routeSummary.replace(/ -> /g, ' \u2192 ');
+  const routeSummary = routeText(orchestration.route, orchestration.routeSummary);
 
   return (
     <div className="mt-2 w-full rounded-[6px] border border-border bg-bg/40 px-3 py-2 text-[12px] tracking-[-0.12px] text-text-dim">
@@ -89,13 +159,13 @@ function OrchestrationDetails({ orchestration }: { orchestration: NonNullable<Te
           <summary className="cursor-pointer select-none data-mono text-text-dim">Timeline</summary>
           <div className="mt-2 flex flex-col gap-1.5">
             {orchestration.timeline.map((event, index) => (
-              <div key={`${event.memberName ?? 'member'}-${index}`} className="rounded-[6px] border border-border/70 bg-surface/60 px-2 py-1.5">
+              <div key={`${event.memberName ?? 'member'}-${index}`} className={`rounded-[6px] border px-2 py-1.5 ${eventBorderClass(event)}`}>
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="data-mono text-text">{event.memberName ?? 'Member'}</span>
+                  <span className={`data-mono ${event.memberName ? 'text-text' : 'text-amber-300'}`}>{event.memberName ?? 'Unknown member'}</span>
                   {event.role && <span>{event.role}</span>}
                   {(event.tool || event.model) && (
                     <span className="text-text-dim">
-                      {event.tool ?? 'provider'}{event.model ? ` / ${event.model}` : ''}
+                      {providerModel(event.tool, event.model)}
                     </span>
                   )}
                   {event.durationMs != null && <span>{formatDuration(event.durationMs)}</span>}
@@ -117,6 +187,90 @@ function OrchestrationDetails({ orchestration }: { orchestration: NonNullable<Te
   );
 }
 
+function RecentRunsPanel({
+  runs,
+  expandedRunId,
+  detailsByRunId,
+  onToggle,
+}: {
+  runs: OrchestratorRunSummary[];
+  expandedRunId: string | null;
+  detailsByRunId: Record<string, OrchestratorRunDetails | undefined>;
+  onToggle: (runId: string) => void;
+}) {
+  if (runs.length === 0) return null;
+
+  return (
+    <div className="rounded-[6px] border border-border bg-bg/70 px-3 py-2 text-[12px] tracking-[-0.12px] text-text-dim">
+      <div className="mb-1.5 flex items-center justify-between gap-2">
+        <span className="data-mono text-text">Recent runs</span>
+        <span>{runs.length}</span>
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {runs.map((run) => {
+          const expanded = expandedRunId === run.runId;
+          const details = detailsByRunId[run.runId];
+          const routeSummary = routeText(run.route, run.routeSummary) || 'Team orchestration';
+          const duration = formatDuration(run.durationMs);
+          return (
+            <div key={run.runId} className="rounded-[6px] border border-border/70 bg-surface/50">
+              <button
+                type="button"
+                className="flex w-full cursor-pointer items-center gap-2 border-none bg-transparent px-2 py-1.5 text-left"
+                onClick={() => onToggle(run.runId)}
+              >
+                <span className="min-w-0 flex-1 truncate data-mono text-text">{routeSummary}</span>
+                {duration && <span className="shrink-0 text-text-dim">{duration}</span>}
+                <span className={`shrink-0 rounded-[4px] border px-1.5 py-0.5 data-mono uppercase ${statusClass(run.status)}`}>
+                  {run.status}
+                </span>
+              </button>
+              <div className="flex items-center gap-2 px-2 pb-1.5 text-[11px] tracking-[-0.11px]">
+                <span>{formatAge(run.finishedAt ?? run.startedAt)}</span>
+                <span>{run.eventCount} events</span>
+              </div>
+              {expanded && (
+                <div className="border-t border-border/70 px-2 py-1.5">
+                  {!details && <p className="status-breathe-fast">Loading details...</p>}
+                  {details && (
+                    <div className="flex flex-col gap-1.5">
+                      {details.members.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {details.members.map((member) => (
+                            <span key={member.name} className="rounded-[4px] bg-bg px-1.5 py-0.5">
+                              {member.name}{member.role ? ` · ${member.role}` : ''}{providerModel(member.tool, member.model) ? ` · ${providerModel(member.tool, member.model)}` : ''}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {details.events.map((event) => (
+                        <div key={event.id} className={`rounded-[6px] border px-2 py-1.5 ${eventBorderClass(event)}`}>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className={`data-mono ${event.memberName ? 'text-text' : 'text-amber-300'}`}>{event.memberName ?? 'Unknown member'}</span>
+                            <span>{event.type.replace(/_/g, ' ')}</span>
+                            {providerModel(event.tool, event.model) && <span>{providerModel(event.tool, event.model)}</span>}
+                            {event.durationMs != null && <span>{formatDuration(event.durationMs)}</span>}
+                            {event.status && (
+                              <span className={`rounded-[4px] border px-1.5 py-0.5 data-mono uppercase ${statusClass(event.status)}`}>
+                                {event.status}
+                              </span>
+                            )}
+                          </div>
+                          {event.summary && <div className="mt-1 line-clamp-2">{event.summary}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function TeamChatRoute() {
   const [params] = useSearchParams();
   const teamId = params.get('id') ?? '';
@@ -127,6 +281,9 @@ export function TeamChatRoute() {
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [recentRuns, setRecentRuns] = useState<OrchestratorRunSummary[]>([]);
+  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+  const [runDetailsById, setRunDetailsById] = useState<Record<string, OrchestratorRunDetails | undefined>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -141,11 +298,40 @@ export function TeamChatRoute() {
     setLoading(false);
   };
 
+  const refreshRuns = async () => {
+    try {
+      const res = await rpc('team.orchestrator.runs.list', { teamId, limit: 5 });
+      if (res.ok && Array.isArray(res.orchestratorRuns)) {
+        setRecentRuns(res.orchestratorRuns as OrchestratorRunSummary[]);
+      }
+    } catch { /* ignore */ }
+  };
+
+  const toggleRun = async (runId: string) => {
+    const nextRunId = expandedRunId === runId ? null : runId;
+    setExpandedRunId(nextRunId);
+    if (!nextRunId || runDetailsById[nextRunId]) return;
+    try {
+      const res = await rpc('team.orchestrator.run.get', { runId: nextRunId });
+      if (res.ok && res.orchestratorRun) {
+        setRunDetailsById((current) => ({
+          ...current,
+          [nextRunId]: res.orchestratorRun as OrchestratorRunDetails,
+        }));
+      }
+    } catch { /* ignore */ }
+  };
+
   useEffect(() => {
     if (!teamId) return;
     refresh();
+    refreshRuns();
     const interval = setInterval(refresh, 3000);
-    return () => clearInterval(interval);
+    const runsInterval = setInterval(refreshRuns, 5000);
+    return () => {
+      clearInterval(interval);
+      clearInterval(runsInterval);
+    };
   }, [teamId]);
 
   useEffect(() => {
@@ -172,12 +358,16 @@ export function TeamChatRoute() {
     try {
       await rpc('team.message.send', { teamId, to: recipient, text: draft.trim() });
       setDraft('');
-      await refresh();
+      await Promise.all([refresh(), refreshRuns()]);
     } catch { /* ignore */ }
     setSending(false);
   };
 
-  const { pullHandlers, PullIndicator } = usePullRefresh(refresh);
+  const refreshAll = async () => {
+    await Promise.all([refresh(), refreshRuns()]);
+  };
+
+  const { pullHandlers, PullIndicator } = usePullRefresh(refreshAll);
 
   const AI_TOOLS = ['claude', 'codex', 'gemini'];
   const isUserMessage = (msg: TeamMessageSummary) => {
@@ -205,6 +395,13 @@ export function TeamChatRoute() {
         {...pullHandlers}
       >
         <PullIndicator />
+        <RecentRunsPanel
+          runs={recentRuns}
+          expandedRunId={expandedRunId}
+          detailsByRunId={runDetailsById}
+          onToggle={toggleRun}
+        />
+
         {loading && (
           <p className="text-[13px] tracking-[-0.13px] text-text-dim text-center py-6 status-breathe-fast">Loading...</p>
         )}

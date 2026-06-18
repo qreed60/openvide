@@ -15,7 +15,7 @@ import { detectTailscaleIp, detectTailscaleHostname, getTailscaleTls } from "./c
 import { encodeQR } from "./qrText.js";
 import * as tm from "./teamManager.js";
 import * as sched from "./scheduleManager.js";
-import { getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
+import { detailOrchestratorRun, getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
 import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
 
 const SOCKET_NAME = "daemon.sock";
@@ -809,7 +809,7 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
     }
 
     case "team.orchestrator.runs.list": {
-      const limit = typeof req.limit === "number" ? req.limit : 20;
+      const limit = typeof req.limit === "number" ? req.limit : undefined;
       const teamId = typeof req.teamId === "string" ? req.teamId : undefined;
       return { ok: true, orchestratorRuns: listRecentOrchestratorRuns(limit, teamId) };
     }
@@ -819,7 +819,7 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       if (!runId) return { ok: false, error: "Missing required: runId" };
       const run = getOrchestratorRun(runId);
       if (!run) return { ok: false, error: `Orchestrator run ${runId} not found` };
-      return { ok: true, orchestratorRun: run };
+      return { ok: true, orchestratorRun: detailOrchestratorRun(run) };
     }
 
     case "team.plan.submit": {

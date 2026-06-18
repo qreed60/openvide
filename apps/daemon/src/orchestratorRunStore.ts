@@ -50,7 +50,50 @@ export interface OrchestratorRunWithEvents extends OrchestratorRunRecord {
   events: OrchestratorRunEvent[];
 }
 
+export interface OrchestratorRunSummary {
+  runId: string;
+  teamId: string;
+  status: OrchestratorRunRecord["status"];
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  route: string[];
+  routeSummary: string;
+  eventCount: number;
+  summary?: string;
+}
+
+export interface OrchestratorRunTimelineEvent {
+  id: string;
+  type: OrchestratorEventType;
+  timestamp: string;
+  memberName?: string;
+  role?: string;
+  tool?: Tool;
+  model?: string;
+  status?: OrchestratorEventStatus;
+  durationMs?: number;
+  summary?: string;
+}
+
+export interface OrchestratorRunMemberSummary {
+  name: string;
+  role?: string;
+  tool?: Tool;
+  model?: string;
+}
+
+export interface OrchestratorRunDetails {
+  summary: OrchestratorRunSummary;
+  events: OrchestratorRunTimelineEvent[];
+  route: string[];
+  routeSummary: string;
+  members: OrchestratorRunMemberSummary[];
+}
+
 const RUNS_DIR = path.join(daemonDir(), "orchestrator-runs");
+const DEFAULT_RECENT_RUN_LIMIT = 10;
+const MAX_RECENT_RUN_LIMIT = 50;
 
 function ensureDir(): void {
   fs.mkdirSync(RUNS_DIR, { recursive: true });
@@ -93,6 +136,79 @@ function compactSummary(text: string | undefined, max = 260): string | undefined
   const normalized = (text ?? "").replace(/\s+/g, " ").trim();
   if (!normalized) return undefined;
   return normalized.length > max ? `${normalized.slice(0, max - 3)}...` : normalized;
+}
+
+function compactRouteSummary(route: string[], fallback?: string): string {
+  if (route.length > 0) return route.join(" -> ");
+  return compactSummary(fallback, 160) ?? "";
+}
+
+function clampLimit(limit: unknown): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit)) return DEFAULT_RECENT_RUN_LIMIT;
+  return Math.min(MAX_RECENT_RUN_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+function runDurationMs(run: OrchestratorRunRecord): number | undefined {
+  const started = Date.parse(run.startedAt);
+  const finished = Date.parse(run.completedAt ?? run.updatedAt);
+  if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) return undefined;
+  return finished - started;
+}
+
+export function summarizeOrchestratorRun(run: OrchestratorRunRecord): OrchestratorRunSummary {
+  return {
+    runId: run.runId,
+    teamId: run.teamId,
+    status: run.status,
+    startedAt: run.startedAt,
+    finishedAt: run.completedAt,
+    durationMs: runDurationMs(run),
+    route: run.route,
+    routeSummary: compactRouteSummary(run.route, run.routeSummary),
+    eventCount: run.eventCount,
+    summary: compactSummary(run.summary),
+  };
+}
+
+function timelineEvent(event: OrchestratorRunEvent): OrchestratorRunTimelineEvent {
+  return {
+    id: event.id,
+    type: event.type,
+    timestamp: event.timestamp,
+    memberName: event.memberName,
+    role: event.role,
+    tool: event.tool,
+    model: event.model,
+    status: event.status,
+    durationMs: event.durationMs,
+    summary: compactSummary(event.summary),
+  };
+}
+
+function memberSummaries(events: OrchestratorRunEvent[]): OrchestratorRunMemberSummary[] {
+  const members = new Map<string, OrchestratorRunMemberSummary>();
+  for (const event of events) {
+    if (!event.memberName) continue;
+    const existing = members.get(event.memberName) ?? { name: event.memberName };
+    members.set(event.memberName, {
+      name: event.memberName,
+      role: event.role ?? existing.role,
+      tool: event.tool ?? existing.tool,
+      model: event.model ?? existing.model,
+    });
+  }
+  return Array.from(members.values());
+}
+
+export function detailOrchestratorRun(run: OrchestratorRunWithEvents): OrchestratorRunDetails {
+  const summary = summarizeOrchestratorRun(run);
+  return {
+    summary,
+    events: run.events.map(timelineEvent),
+    route: summary.route,
+    routeSummary: summary.routeSummary,
+    members: memberSummaries(run.events),
+  };
 }
 
 function eventId(runId: string, index: number): string {
@@ -169,14 +285,15 @@ export function finishOrchestratorRun(
   return next;
 }
 
-export function listRecentOrchestratorRuns(limit = 20, teamId?: string): OrchestratorRunRecord[] {
+export function listRecentOrchestratorRuns(limit?: number, teamId?: string): OrchestratorRunSummary[] {
   try {
     return fs.readdirSync(RUNS_DIR)
       .filter((file) => file.endsWith(".json"))
       .map((file) => readJson<OrchestratorRunRecord>(path.join(RUNS_DIR, file)))
       .filter((run): run is OrchestratorRunRecord => Boolean(run && (!teamId || run.teamId === teamId)))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .slice(0, Math.max(1, limit));
+      .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+      .slice(0, clampLimit(limit))
+      .map(summarizeOrchestratorRun);
   } catch {
     return [];
   }
