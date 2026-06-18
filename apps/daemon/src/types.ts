@@ -3,6 +3,7 @@ import type { TeamMetadata } from "./teamMetadata.js";
 // ── Session & State ──
 
 export type Tool = "claude" | "codex" | "gemini";
+export type TeamTool = Tool | "opencode" | "openhands";
 export type SessionExecutionBackend = "cli" | "codex_app_server";
 
 export type SessionStatus =
@@ -348,7 +349,7 @@ export type AgentRole =
 
 export interface TeamMember {
   name: string;
-  tool: Tool;
+  tool: TeamTool;
   model?: string;
   role: AgentRole;
   sessionId: string;
@@ -389,7 +390,7 @@ export interface TeamMessage {
   id: string;
   teamId: string;
   from: string;
-  fromTool?: Tool;
+  fromTool?: TeamTool;
   to: string;
   text: string;
   createdAt: string;
@@ -405,7 +406,7 @@ export interface TeamMessageOrchestration {
   timeline: Array<{
     memberName?: string;
     role?: string;
-    tool?: Tool;
+    tool?: TeamTool;
     model?: string;
     status?: "started" | "completed" | "blocked" | "failed";
     durationMs?: number;

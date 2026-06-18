@@ -1,8 +1,9 @@
+import * as child_process from "node:child_process";
 import * as sm from "./sessionManager.js";
-import type { IpcResponse, TeamMember, Tool } from "./types.js";
+import type { IpcResponse, TeamMember, TeamTool, Tool } from "./types.js";
 
-export type AgentProvider = Tool | "opencode" | "openhands";
-export type ProviderStatus = "enabled" | "planned" | "installed-but-not-executable" | "disabled" | "unavailable";
+export type AgentProvider = TeamTool;
+export type ProviderStatus = "enabled" | "planned" | "installed-but-not-executable" | "installed-but-disabled" | "disabled" | "unavailable";
 
 export interface ProviderCapabilities {
   canEdit: boolean;
@@ -22,6 +23,7 @@ export interface ProviderExecutionCompletion {
 export interface ProviderExecutionRequest {
   member: TeamMember;
   prompt: string;
+  cwd?: string;
   waitForCompletion: (sessionId: string) => Promise<ProviderExecutionCompletion>;
 }
 
@@ -30,10 +32,19 @@ export interface ProviderExecutionResult extends ProviderExecutionCompletion {
   sessionId: string;
   ok: boolean;
   error?: string;
+  diagnostics?: {
+    command?: string;
+    args?: string[];
+    cwd?: string;
+    exitCode?: number | null;
+    stdout?: string;
+    stderr?: string;
+    timedOut?: boolean;
+  };
 }
 
 export interface ProviderAdapter {
-  provider: Tool;
+  provider: AgentProvider;
   label: string;
   capabilities: ProviderCapabilities;
   execute(request: ProviderExecutionRequest): Promise<ProviderExecutionResult>;
@@ -71,10 +82,19 @@ const cliCapabilities = (overrides: Partial<ProviderCapabilities> = {}): Provide
   ...overrides,
 });
 
+const OPENCODE_ENABLE_FLAG = "OPENVIDE_ENABLE_OPENCODE_PROVIDER";
+const OPENCODE_EXECUTION_TIMEOUT_MS = 5 * 60 * 1000;
+
+export function isOpenCodeProviderEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = (env[OPENCODE_ENABLE_FLAG] ?? "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
 function failedExecution(
   provider: AgentProvider,
   sessionId: string,
   error: string,
+  diagnostics?: ProviderExecutionResult["diagnostics"],
 ): ProviderExecutionResult {
   return {
     provider,
@@ -84,6 +104,7 @@ function failedExecution(
     responseText: "",
     errorText: error,
     error,
+    diagnostics,
   };
 }
 
@@ -126,13 +147,119 @@ function makeCliProviderAdapter(
   };
 }
 
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function extractOpenCodeFinalText(stdout: string): string {
+  return stripAnsi(stdout).trim();
+}
+
+function supportsOpenCodeModelArg(model: string | undefined): model is string {
+  if (!model) return false;
+  return /^[^/\s]+\/[^/\s]+$/.test(model);
+}
+
+function resolveOpenCodeCommand(): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    child_process.execFile("sh", ["-lc", "command -v opencode"], { timeout: 1500, maxBuffer: 4096 }, (err, stdout) => {
+      if (err) {
+        resolve(undefined);
+        return;
+      }
+      const command = stdout.toString().trim().split(/\r?\n/)[0]?.trim();
+      resolve(command || undefined);
+    });
+  });
+}
+
+function execFileCaptured(
+  command: string,
+  args: string[],
+  cwd: string | undefined,
+  timeout: number,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string; error?: string; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    child_process.execFile(command, args, { cwd, timeout, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      const nodeErr = err as (NodeJS.ErrnoException & { killed?: boolean; signal?: NodeJS.Signals }) | null;
+      resolve({
+        exitCode: typeof nodeErr?.code === "number" ? nodeErr.code : nodeErr ? null : 0,
+        stdout: stdout.toString(),
+        stderr: stderr.toString(),
+        error: nodeErr ? nodeErr.message : undefined,
+        timedOut: Boolean(nodeErr?.killed && nodeErr?.signal === "SIGTERM"),
+      });
+    });
+  });
+}
+
+export const opencodeProviderAdapter: ProviderAdapter = {
+  provider: "opencode",
+  label: "OpenCode",
+  capabilities: {
+    canEdit: true,
+    canReview: true,
+    supportsVision: false,
+    supportsLongRunning: false,
+    supportsStatusPolling: false,
+    supportsModelOverride: true,
+  },
+  async execute(request) {
+    const { member, prompt, cwd } = request;
+    if (!isOpenCodeProviderEnabled()) {
+      return failedExecution("opencode", member.sessionId, `OpenCode provider is installed but disabled. Set ${OPENCODE_ENABLE_FLAG}=1 to enable execution.`);
+    }
+
+    const command = await resolveOpenCodeCommand();
+    if (!command) {
+      return failedExecution("opencode", member.sessionId, "OpenCode provider is enabled but the opencode executable was not found");
+    }
+
+    const args = ["run"];
+    if (supportsOpenCodeModelArg(member.model)) {
+      args.push("--model", member.model);
+    }
+    args.push(prompt);
+
+    const result = await execFileCaptured(command, args, cwd, OPENCODE_EXECUTION_TIMEOUT_MS);
+    const diagnostics = {
+      command,
+      args,
+      cwd,
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      timedOut: result.timedOut,
+    };
+
+    if (result.timedOut) {
+      return failedExecution("opencode", member.sessionId, `OpenCode provider timed out after ${OPENCODE_EXECUTION_TIMEOUT_MS}ms`, diagnostics);
+    }
+    if (result.exitCode !== 0) {
+      const stderr = stripAnsi(result.stderr).trim();
+      const error = stderr || result.error || `OpenCode provider exited with code ${result.exitCode}`;
+      return failedExecution("opencode", member.sessionId, error, diagnostics);
+    }
+
+    return {
+      provider: "opencode",
+      sessionId: member.sessionId,
+      ok: true,
+      status: "idle",
+      responseText: extractOpenCodeFinalText(result.stdout),
+      errorText: stripAnsi(result.stderr).trim() || undefined,
+      diagnostics,
+    };
+  },
+};
+
 export const codexProviderAdapter: ProviderAdapter = makeCliProviderAdapter(
   "codex",
   "Codex",
   cliCapabilities(),
 );
 
-const providerAdapters = new Map<Tool, ProviderAdapter>([
+const cliProviderAdapters = new Map<Tool, ProviderAdapter>([
   ["claude", makeCliProviderAdapter("claude", "Claude", cliCapabilities({ supportsVision: true }))],
   ["codex", codexProviderAdapter],
   ["gemini", makeCliProviderAdapter("gemini", "Gemini", cliCapabilities({ supportsVision: true }))],
@@ -181,10 +308,11 @@ const plannedProviders: ProviderRegistryEntry[] = [
 
 export function getProviderAdapter(provider: string | undefined): ProviderAdapter | undefined {
   if (!provider) return undefined;
-  return providerAdapters.get(provider as Tool);
+  if (provider === "opencode") return isOpenCodeProviderEnabled() ? opencodeProviderAdapter : undefined;
+  return cliProviderAdapters.get(provider as Tool);
 }
 
-export function isExecutableAgentProvider(provider: string | undefined): provider is Tool {
+export function isExecutableAgentProvider(provider: string | undefined): provider is AgentProvider {
   return getProviderAdapter(provider) !== undefined;
 }
 
@@ -213,8 +341,27 @@ function plannedProviderEntry(
   };
 }
 
+function openCodeProviderEntry(installedTools: Record<string, boolean | ProviderDetectionInfo>): ProviderRegistryEntry {
+  const detection = normalizeDetection(installedTools, "opencode");
+  const available = detection.available === true;
+  const enabled = isOpenCodeProviderEnabled();
+  return {
+    id: "opencode",
+    label: "OpenCode",
+    type: enabled ? "cli" : "planned",
+    status: available ? (enabled ? "enabled" : "installed-but-disabled") : "unavailable",
+    available,
+    enabled,
+    executable: available && enabled,
+    planned: !enabled,
+    modelOverride: enabled && opencodeProviderAdapter.capabilities.supportsModelOverride,
+    capabilities: opencodeProviderAdapter.capabilities,
+    detection,
+  };
+}
+
 export function listProviderRegistryEntries(installedTools: Record<string, boolean | ProviderDetectionInfo>): ProviderRegistryEntry[] {
-  const executable = [...providerAdapters.values()].map((adapter) => {
+  const executable = [...cliProviderAdapters.values()].map((adapter) => {
     const detection = normalizeDetection(installedTools, adapter.provider);
     const available = detection.available === true;
     return {
@@ -232,12 +379,25 @@ export function listProviderRegistryEntries(installedTools: Record<string, boole
     } satisfies ProviderRegistryEntry;
   });
 
-  return [...executable, ...plannedProviders.map((entry) => plannedProviderEntry(entry, installedTools))];
+  return [
+    ...executable,
+    openCodeProviderEntry(installedTools),
+    ...plannedProviders
+      .filter((entry) => entry.id !== "opencode")
+      .map((entry) => plannedProviderEntry(entry, installedTools)),
+  ];
 }
 
 export async function executeProviderTurn(request: ProviderExecutionRequest): Promise<ProviderExecutionResult> {
   const adapter = getProviderAdapter(request.member.tool);
   if (!adapter) {
+    if (request.member.tool === "opencode" && !isOpenCodeProviderEnabled()) {
+      return failedExecution(
+        "opencode",
+        request.member.sessionId,
+        `OpenCode provider is installed but disabled. Set ${OPENCODE_ENABLE_FLAG}=1 to enable execution.`,
+      );
+    }
     return failedExecution(
       request.member.tool,
       request.member.sessionId,

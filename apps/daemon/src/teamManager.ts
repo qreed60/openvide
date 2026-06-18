@@ -20,7 +20,7 @@ import { getCoordinatorMember, normalizeTeamRole, roleMatches } from "./teamRole
 import type {
   TeamConfig, TeamMember, TeamTask, TaskStatus, TaskComment,
   TeamMessage, TeamMessageOrchestration, TeamPlan, PlanRevision, PlanReviewVote, PlanMode,
-  Tool, IpcResponse, TeamRoutingPolicy,
+  Tool, TeamTool, IpcResponse, TeamRoutingPolicy,
 } from "./types.js";
 
 const TEAMS_DIR = path.join(daemonDir(), "teams");
@@ -80,9 +80,24 @@ function normalizeRoutingPolicy(policy: TeamRoutingPolicy | undefined): TeamRout
   return Object.keys(next).length > 0 ? next : undefined;
 }
 
-function executableToolOrThrow(tool: string): Tool {
+function executableToolOrThrow(tool: string): TeamTool {
   if (isExecutableTeamTool(tool)) return tool;
   throw new Error(`Team provider ${tool || "(missing)"} is not enabled for execution`);
+}
+
+function isSessionBackedTool(tool: TeamTool): tool is Tool {
+  return tool === "claude" || tool === "codex" || tool === "gemini";
+}
+
+function directProviderSessionId(teamId: string, memberName: string, tool: TeamTool): string {
+  const safeName = memberName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "member";
+  return `${tool}:${teamId}:${safeName}`;
+}
+
+function removeMemberSession(member: TeamMember): void {
+  if (isSessionBackedTool(member.tool)) {
+    sm.removeSession(member.sessionId);
+  }
 }
 
 // ── Team CRUD ──
@@ -99,6 +114,15 @@ export function createTeam(
   // Create a daemon session for each member
   const resolvedMembers: TeamMember[] = members.map((m) => {
     const tool = executableToolOrThrow(m.tool);
+    if (!isSessionBackedTool(tool)) {
+      return {
+        name: m.name,
+        tool,
+        model: m.model,
+        role: normalizeTeamRole(m.role),
+        sessionId: directProviderSessionId(teamId, m.name, tool),
+      };
+    }
     const session = sm.createSession(
       tool,
       workingDirectory,
@@ -169,13 +193,15 @@ export function updateTeam(
   const resolvedMembers: TeamMember[] = nextMembersInput.map((member) => {
     const existing = currentByName.get(member.name);
     if (existing && existing.tool === member.tool && existing.model === member.model) {
-      sm.updateSession(existing.sessionId, {
-        workingDirectory: nextWorkingDirectory,
-        model: member.model,
-        runKind: "team",
-        teamId,
-        teamName: nextName,
-      });
+      if (isSessionBackedTool(existing.tool)) {
+        sm.updateSession(existing.sessionId, {
+          workingDirectory: nextWorkingDirectory,
+          model: member.model,
+          runKind: "team",
+          teamId,
+          teamName: nextName,
+        });
+      }
       reusedSessionIds.add(existing.sessionId);
       return {
         ...existing,
@@ -185,6 +211,15 @@ export function updateTeam(
     }
 
     const tool = executableToolOrThrow(member.tool);
+    if (!isSessionBackedTool(tool)) {
+      return {
+        name: member.name,
+        tool,
+        model: member.model,
+        role: normalizeTeamRole(member.role),
+        sessionId: directProviderSessionId(teamId, member.name, tool),
+      };
+    }
     const session = sm.createSession(
       tool,
       nextWorkingDirectory,
@@ -204,7 +239,7 @@ export function updateTeam(
 
   for (const member of current.members) {
     if (!reusedSessionIds.has(member.sessionId)) {
-      sm.removeSession(member.sessionId);
+      removeMemberSession(member);
     }
   }
 
@@ -242,7 +277,7 @@ export function deleteTeam(teamId: string): boolean {
 
   // Remove member sessions
   for (const member of team.members) {
-    sm.removeSession(member.sessionId);
+    removeMemberSession(member);
   }
 
   // Remove team directory
@@ -523,7 +558,7 @@ export function addComment(teamId: string, taskId: string, author: string, text:
 
 function writeTeamMessage(
   teamId: string,
-  input: { from: string; to: string; text: string; fromTool?: Tool; orchestration?: TeamMessageOrchestration },
+  input: { from: string; to: string; text: string; fromTool?: TeamTool; orchestration?: TeamMessageOrchestration },
 ): TeamMessage {
   const team = getTeam(teamId);
   const memberTool = team?.members.find((member) => member.name === input.from)?.tool;
@@ -755,7 +790,7 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
       void runTeamOrchestrator({
         team,
         userText: text,
-        invokeMember: invokeMemberTurn,
+        invokeMember: (member, prompt) => invokeMemberTurn(member, prompt, team.workingDirectory),
         writeFinalMessage: (fromName, finalText, orchestration) => {
           writeTeamMessage(teamId, {
             from: fromName,
@@ -784,7 +819,15 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
   return msg;
 }
 
-function invokeMemberTurn(member: TeamMember, prompt: string): Promise<SessionCompletion> {
+function memberWorkingDirectory(member: TeamMember): string | undefined {
+  const session = isSessionBackedTool(member.tool) ? sm.getSession(member.sessionId) : undefined;
+  if (session?.workingDirectory) return session.workingDirectory;
+  return Object.values(sm.getState().teams ?? {})
+    .find((team) => team.members.some((teamMember) => teamMember.sessionId === member.sessionId))
+    ?.workingDirectory;
+}
+
+function invokeMemberTurn(member: TeamMember, prompt: string, cwd?: string): Promise<SessionCompletion> {
   if (activeWatchers.has(member.sessionId)) {
     return Promise.resolve({
       status: "failed",
@@ -797,6 +840,7 @@ function invokeMemberTurn(member: TeamMember, prompt: string): Promise<SessionCo
     return executeProviderTurn({
       member,
       prompt,
+      cwd: cwd ?? memberWorkingDirectory(member),
       waitForCompletion: waitForSessionCompletion,
     }).then((result) => {
       return {

@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { daemonDir, nowISO } from "./utils.js";
-import type { TeamMessageOrchestration, Tool } from "./types.js";
+import type { TeamMessageOrchestration, TeamTool } from "./types.js";
 
 export type OrchestratorEventType =
   | "orchestrator_start"
@@ -24,7 +24,7 @@ export interface OrchestratorRunEvent {
   timestamp: string;
   memberName?: string;
   role?: string;
-  tool?: Tool;
+  tool?: TeamTool;
   model?: string;
   status?: OrchestratorEventStatus;
   durationMs?: number;
@@ -69,7 +69,7 @@ export interface OrchestratorRunTimelineEvent {
   timestamp: string;
   memberName?: string;
   role?: string;
-  tool?: Tool;
+  tool?: TeamTool;
   model?: string;
   status?: OrchestratorEventStatus;
   durationMs?: number;
@@ -79,7 +79,7 @@ export interface OrchestratorRunTimelineEvent {
 export interface OrchestratorRunMemberSummary {
   name: string;
   role?: string;
-  tool?: Tool;
+  tool?: TeamTool;
   model?: string;
 }
 
