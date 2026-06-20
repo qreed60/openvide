@@ -776,6 +776,21 @@ export async function runTeamOrchestrator(input: RunTeamOrchestratorInput): Prom
     input.writeFinalMessage(lead?.name ?? "Lead", finalText, createMessageOrchestration(runId));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof Error && err.name === "TeamQueueDispatchPause") {
+      log(`team.orchestrator.pause team=${input.team.id} reason=${message}`);
+      appendOrchestratorEvent(runId, {
+        teamId: input.team.id,
+        type: "orchestrator_error",
+        memberName: lead?.name,
+        role: lead ? normalizeTeamRole(lead.role) : undefined,
+        tool: lead?.tool,
+        model: lead?.model,
+        status: "blocked",
+        summary: message,
+      });
+      finishOrchestratorRun(runId, "blocked", message);
+      throw err;
+    }
     log(`team.orchestrator.error team=${input.team.id} reason=exception error=${message}`);
     appendOrchestratorEvent(runId, {
       teamId: input.team.id,

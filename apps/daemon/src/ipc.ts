@@ -28,6 +28,7 @@ import {
   listTeamQueueTasks,
 } from "./teamQueueStore.js";
 import { getResourceStatus, listResourceStatus, modelResourceKey } from "./modelResourceScheduler.js";
+import { dispatchTeamQueueOnce, getTeamQueueDispatchStatus } from "./teamQueueDispatcher.js";
 import type { ProviderDetectionInfo } from "./agentProviders.js";
 import type { TeamQueueTaskSource } from "./teamQueueTypes.js";
 
@@ -836,6 +837,22 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       const teamId = req.teamId as string | undefined;
       if (!teamId) return { ok: false, error: "Missing required: teamId" };
       return { ok: true, queueStatus: getTeamQueueStatus(teamId) };
+    }
+
+    case "team.queue.dispatch_once": {
+      try {
+        return { ok: true, queueDispatch: await dispatchTeamQueueOnce() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    case "team.queue.dispatch_status": {
+      try {
+        return { ok: true, queueDispatch: getTeamQueueDispatchStatus() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
     }
 
     case "team.create": {

@@ -1,5 +1,12 @@
 import type { TeamMetadata } from "./teamMetadata.js";
-import type { ModelResourceStatus, ModelResourceStatusSummary, TeamQueueRun, TeamQueueStatusSummary, TeamQueueTask } from "./teamQueueTypes.js";
+import type {
+  ModelResourceStatus,
+  ModelResourceStatusSummary,
+  TeamQueueDispatchResult,
+  TeamQueueRun,
+  TeamQueueStatusSummary,
+  TeamQueueTask,
+} from "./teamQueueTypes.js";
 
 // ── Session & State ──
 
@@ -265,6 +272,7 @@ export interface IpcResponse {
   tools?: Record<string, boolean>;
   teamMetadata?: TeamMetadata;
   queueStatus?: TeamQueueStatusSummary;
+  queueDispatch?: TeamQueueDispatchResult;
   resourceStatus?: ModelResourceStatus | ModelResourceStatusSummary;
   orchestrator?: { available: boolean; enabled: boolean; provider: string; runStore: boolean };
   orchestratorRuns?: unknown[];

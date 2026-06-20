@@ -197,3 +197,37 @@ export interface CreateTeamQueueTaskInput {
   sourceRef?: TeamQueueTask["sourceRef"];
   metadata?: Record<string, unknown>;
 }
+
+export type TeamQueueDispatchEventType =
+  | "task_dispatch_started"
+  | "run_waiting_for_team_slot"
+  | "member_waiting_for_model"
+  | "model_resource_acquired"
+  | "run_started"
+  | "run_completed"
+  | "run_failed"
+  | "model_resource_released";
+
+export interface TeamQueueDispatchEvent {
+  id: string;
+  type: TeamQueueDispatchEventType;
+  timestamp: string;
+  teamId: string;
+  taskId?: string;
+  runId?: string;
+  turnId?: string;
+  memberName?: string;
+  resourceKey?: string;
+  status?: TeamQueueTaskStatus | TeamQueueRunStatus | TeamQueueTurnStatus | TeamQueueResourceStatus;
+  reason?: string;
+  summary?: string;
+}
+
+export interface TeamQueueDispatchResult {
+  statePath: string;
+  dispatchedRunIds: string[];
+  waitingRunIds: string[];
+  failedRunIds: string[];
+  skippedRunIds: string[];
+  events: TeamQueueDispatchEvent[];
+}

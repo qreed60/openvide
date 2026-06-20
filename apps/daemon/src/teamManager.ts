@@ -828,7 +828,14 @@ function memberWorkingDirectory(member: TeamMember): string | undefined {
     ?.workingDirectory;
 }
 
-function invokeMemberTurn(member: TeamMember, prompt: string, cwd?: string): Promise<SessionCompletion> {
+export type TeamMemberTurnCompletion = SessionCompletion;
+
+export type TeamMemberTurnInvoker = (
+  member: TeamMember,
+  prompt: string,
+) => Promise<TeamMemberTurnCompletion>;
+
+export function invokeTeamMemberTurn(member: TeamMember, prompt: string, cwd?: string): Promise<SessionCompletion> {
   if (activeWatchers.has(member.sessionId)) {
     return Promise.resolve({
       status: "failed",
@@ -859,6 +866,10 @@ function invokeMemberTurn(member: TeamMember, prompt: string, cwd?: string): Pro
       errorText: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+function invokeMemberTurn(member: TeamMember, prompt: string, cwd?: string): Promise<SessionCompletion> {
+  return invokeTeamMemberTurn(member, prompt, cwd);
 }
 
 function sendPromptToMember(member: TeamMember, prompt: string, teamId: string): boolean {
@@ -976,6 +987,49 @@ function watchSessionResponse(sessionId: string, onComplete: (result: SessionCom
 
 export function listMessages(teamId: string, limit?: number): TeamMessage[] {
   return readJsonl<TeamMessage>(path.join(teamDir(teamId), "messages.jsonl"), limit);
+}
+
+export async function runQueuedTeamChat(input: {
+  teamId: string;
+  from: string;
+  to: string;
+  text: string;
+  invokeMember?: TeamMemberTurnInvoker;
+  persistMessages?: boolean;
+}): Promise<TeamMessage | undefined> {
+  const team = getTeam(input.teamId);
+  if (!team) throw new Error(`Team ${input.teamId} not found`);
+  if (input.from !== "user" || input.to !== "*") {
+    throw new Error("Queued Team Chat dispatch currently supports user-to-team messages only");
+  }
+
+  const persistMessages = input.persistMessages !== false;
+  const msg = persistMessages
+    ? writeTeamMessage(input.teamId, {
+      from: input.from,
+      to: input.to,
+      text: input.text,
+    })
+    : undefined;
+
+  await runTeamOrchestrator({
+    team,
+    userText: input.text,
+    invokeMember: input.invokeMember ?? ((member, prompt) => invokeMemberTurn(member, prompt, team.workingDirectory)),
+    writeFinalMessage: (fromName, finalText, orchestration) => {
+      if (!persistMessages) return;
+      writeTeamMessage(input.teamId, {
+        from: fromName,
+        to: "user",
+        text: finalText.slice(0, 4000),
+        orchestration,
+      });
+    },
+    summarizePlan: (memberName) => summarizePlanForChat(input.teamId, memberName),
+    summarizeBoard: (memberName) => summarizeBoardForChat(input.teamId, memberName),
+  });
+
+  return msg;
 }
 
 // ── Plans ──
