@@ -19,6 +19,7 @@ import { detailOrchestratorRun, getOrchestratorRun, listRecentOrchestratorRuns }
 import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
 import { getTeamMetadata } from "./teamMetadata.js";
 import { getTeamQueueStatus } from "./teamQueueStore.js";
+import { getResourceStatus, listResourceStatus, modelResourceKey } from "./modelResourceScheduler.js";
 import type { ProviderDetectionInfo } from "./agentProviders.js";
 
 const SOCKET_NAME = "daemon.sock";
@@ -422,6 +423,21 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       }
       const models = await listCodexModels();
       return { ok: true, models };
+    }
+
+    case "model.resources.status": {
+      const resourceKey = req.resourceKey as string | undefined;
+      const provider = req.provider as string | undefined;
+      const model = req.model as string | undefined;
+      try {
+        if (resourceKey || provider) {
+          const key = resourceKey ?? modelResourceKey(provider as string, model);
+          return { ok: true, resourceStatus: getResourceStatus(key) };
+        }
+        return { ok: true, resourceStatus: listResourceStatus() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
     }
 
     case "config.setPushToken": {

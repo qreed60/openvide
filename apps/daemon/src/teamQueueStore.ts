@@ -115,6 +115,8 @@ function recoverStaleActiveState(state: TeamQueueState): { state: TeamQueueState
   for (const resource of Object.values(state.resources)) {
     if (!resource.activeTurnId) continue;
     resource.activeTurnId = undefined;
+    const { owner: _owner, ...metadata } = resource.metadata ?? {};
+    resource.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
     if (resource.status === "running" || resource.status === "reserved") {
       resource.status = "available";
     }

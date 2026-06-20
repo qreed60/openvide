@@ -7,6 +7,7 @@ import { tryCacheClaudeAuth } from "./authCache.js";
 import * as sm from "./sessionManager.js";
 import { startBridge, stopBridge, isBridgeRunning } from "./bridgeServer.js";
 import { initScheduler, stopScheduler } from "./scheduleManager.js";
+import { initializeModelResourceScheduler } from "./modelResourceScheduler.js";
 
 const PID_FILE = "daemon.pid";
 const LOG_FILE = "daemon.log";
@@ -237,6 +238,7 @@ export function runDaemonMain(): void {
   // Initialize session manager (loads state, marks interrupted)
   sm.init();
   initScheduler();
+  initializeModelResourceScheduler();
 
   // Try to cache Claude auth credentials from Keychain.
   // Succeeds when daemon is started from a local GUI session (not SSH).

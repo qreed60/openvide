@@ -88,6 +88,7 @@ assert.equal(recovered.turns.turn_1.status, "interrupted");
 assert.ok(recovered.turns.turn_1.finishedAt);
 assert.equal(recovered.resources["codex:qwen35_2b"].status, "available");
 assert.equal(recovered.resources["codex:qwen35_2b"].activeTurnId, undefined);
+assert.equal(recovered.resources["codex:qwen35_2b"].metadata?.owner, undefined);
 
 updateTeamQueueState((state) => {
   state.tasks.task_2 = {

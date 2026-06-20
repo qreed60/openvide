@@ -111,6 +111,46 @@ export interface TeamQueueResource {
   metadata?: Record<string, unknown>;
 }
 
+export interface ModelResourceOwnerMetadata {
+  turnId?: string;
+  runId?: string;
+  teamId?: string;
+  taskId?: string;
+  memberName?: string;
+  provider?: TeamTool;
+  model?: string;
+  requestedAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export type ModelResourceAcquireStatus = "acquired" | "waiting" | "disabled";
+
+export interface ModelResourceAcquireResult {
+  status: ModelResourceAcquireStatus;
+  resource: TeamQueueResource;
+  owner: ModelResourceOwnerMetadata;
+  blockedByTurnId?: string;
+  blockedByRunId?: string;
+}
+
+export interface ModelResourceStatus {
+  key: string;
+  provider: TeamTool;
+  model: string;
+  status: TeamQueueResourceStatus;
+  activeTurnId?: string;
+  activeRunId?: string;
+  queuedTurnIds: string[];
+  updatedAt: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ModelResourceStatusSummary {
+  statePath: string;
+  updatedAt: string;
+  resources: ModelResourceStatus[];
+}
+
 export interface TeamQueueState {
   version: 1;
   createdAt: string;
