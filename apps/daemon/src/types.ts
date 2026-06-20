@@ -6,6 +6,7 @@ import type {
   TeamQueueRun,
   TeamQueueStatusSummary,
   TeamQueueTask,
+  TeamBoardItem,
 } from "./teamQueueTypes.js";
 
 // ── Session & State ──
@@ -258,6 +259,8 @@ export interface IpcResponse {
   teams?: TeamConfig[];
   teamTasks?: TeamTask[];
   teamTask?: TeamTask;
+  boardItems?: TeamBoardItem[];
+  boardItem?: TeamBoardItem;
   queueTasks?: TeamQueueTask[];
   queueTask?: TeamQueueTask;
   queueRuns?: TeamQueueRun[];

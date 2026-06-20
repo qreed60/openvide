@@ -34,6 +34,25 @@ export type TeamQueueTurnStatus =
 
 export type TeamQueueResourceStatus = "available" | "reserved" | "running" | "disabled";
 
+export type TeamBoardExecutionStatus =
+  | "draft"
+  | "queued"
+  | "waiting_for_team_slot"
+  | "waiting_for_model"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "blocked";
+
+export type TeamBoardReviewStatus =
+  | "not_required"
+  | "pending_review"
+  | "approved"
+  | "revise"
+  | "rejected";
+
 export interface TeamQueueTask {
   id: string;
   teamId: string;
@@ -159,6 +178,42 @@ export interface TeamQueueState {
   runs: Record<string, TeamQueueRun>;
   turns: Record<string, TeamQueueTurn>;
   resources: Record<string, TeamQueueResource>;
+}
+
+export interface TeamBoardItem {
+  id: string;
+  teamId: string;
+  title: string;
+  description?: string;
+  source: "board";
+  executionStatus: TeamBoardExecutionStatus;
+  reviewStatus: TeamBoardReviewStatus;
+  assignedMembers: string[];
+  reviewerMembers: string[];
+  priority: number;
+  queueTaskId: string;
+  queueRunIds: string[];
+  createdAt: string;
+  updatedAt: string;
+  queuedAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  blockedReason?: string;
+  reviewFeedback?: string;
+}
+
+export interface CreateTeamBoardItemInput {
+  teamId: string;
+  title: string;
+  description?: string;
+  assignedMembers?: string[];
+  reviewerMembers?: string[];
+  priority?: number;
+  createdBy?: string;
+  executionStatus?: "draft" | "queued" | "blocked";
+  reviewStatus?: TeamBoardReviewStatus;
+  reviewFeedback?: string;
+  blockedReason?: string;
 }
 
 export interface TeamQueueStatusSummary {

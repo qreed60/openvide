@@ -162,6 +162,10 @@ function sortedDispatchableRuns(state: TeamQueueState): Array<{ task: TeamQueueT
     .filter((item): item is { task: TeamQueueTask; run: TeamQueueRun } => Boolean(item.task))
     .filter(({ task, run }) => {
       if (TERMINAL_TASK_STATUSES.has(task.status)) return false;
+      if (task.source === "board" && typeof task.metadata?.board === "object") {
+        const board = task.metadata.board as { executionStatus?: unknown };
+        if (board.executionStatus === "draft" || board.executionStatus === "blocked") return false;
+      }
       return DISPATCHABLE_RUN_STATUSES.has(run.status);
     })
     .sort((left, right) => {

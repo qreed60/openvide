@@ -27,10 +27,17 @@ import {
   listTeamQueueRuns,
   listTeamQueueTasks,
 } from "./teamQueueStore.js";
+import {
+  cancelTeamBoardItem,
+  createTeamBoardItem,
+  getTeamBoardItem,
+  listTeamBoardItems,
+  setTeamBoardReviewStatus,
+} from "./teamBoardStore.js";
 import { getResourceStatus, listResourceStatus, modelResourceKey } from "./modelResourceScheduler.js";
 import { dispatchTeamQueueOnce, getTeamQueueDispatchStatus } from "./teamQueueDispatcher.js";
 import type { ProviderDetectionInfo } from "./agentProviders.js";
-import type { TeamQueueTaskSource } from "./teamQueueTypes.js";
+import type { TeamBoardReviewStatus, TeamQueueTaskSource } from "./teamQueueTypes.js";
 
 const SOCKET_NAME = "daemon.sock";
 
@@ -150,6 +157,20 @@ function taskSourceValue(value: unknown, fallback: TeamQueueTaskSource): TeamQue
     return source;
   }
   return fallback;
+}
+
+function boardReviewStatusValue(value: unknown): TeamBoardReviewStatus | undefined {
+  const status = stringValue(value);
+  if (
+    status === "not_required"
+    || status === "pending_review"
+    || status === "approved"
+    || status === "revise"
+    || status === "rejected"
+  ) {
+    return status;
+  }
+  return undefined;
 }
 
 function queueAssignedMembers(req: IpcRequest): string[] | undefined {
@@ -933,6 +954,73 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       const deleted = tm.deleteTeam(teamId);
       if (!deleted) return { ok: false, error: `Team ${teamId} not found` };
       return { ok: true };
+    }
+
+    case "team.board.items.list": {
+      const teamId = stringValue(req.teamId);
+      if (!teamId) return { ok: false, error: "Missing required: teamId" };
+      return { ok: true, boardItems: listTeamBoardItems(teamId) };
+    }
+
+    case "team.board.item.get": {
+      const itemId = stringValue(req.itemId) ?? stringValue(req.boardItemId) ?? stringValue(req.id);
+      if (!itemId) return { ok: false, error: "Missing required: itemId" };
+      const boardItem = getTeamBoardItem(itemId);
+      if (!boardItem) return { ok: false, error: `Board item ${itemId} not found` };
+      return { ok: true, boardItem };
+    }
+
+    case "team.board.item.create": {
+      const teamId = stringValue(req.teamId);
+      const title = stringValue(req.title) ?? stringValue(req.subject);
+      if (!teamId || !title) return { ok: false, error: "Missing required: teamId, title" };
+      try {
+        const created = createTeamBoardItem({
+          teamId,
+          title,
+          description: stringValue(req.description) ?? stringValue(req.prompt),
+          assignedMembers: stringArrayValue(req.assignedMembers) ?? stringArrayValue(req.assignedMemberNames) ?? queueAssignedMembers(req),
+          reviewerMembers: stringArrayValue(req.reviewerMembers) ?? stringArrayValue(req.reviewers),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.createdBy) ?? stringValue(req.from) ?? "user",
+          executionStatus: stringValue(req.executionStatus) === "draft" || stringValue(req.executionStatus) === "blocked"
+            ? stringValue(req.executionStatus) as "draft" | "blocked"
+            : "queued",
+          reviewStatus: boardReviewStatusValue(req.reviewStatus),
+          reviewFeedback: stringValue(req.reviewFeedback),
+          blockedReason: stringValue(req.blockedReason),
+        });
+        return {
+          ok: true,
+          boardItem: created.boardItem,
+          queueTask: created.queueTask,
+          queueRuns: created.queueRuns,
+          queueRun: created.queueRuns[0],
+        };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    case "team.board.item.cancel": {
+      const itemId = stringValue(req.itemId) ?? stringValue(req.boardItemId) ?? stringValue(req.id) ?? stringValue(req.taskId);
+      if (!itemId) return { ok: false, error: "Missing required: itemId" };
+      const cancelled = cancelTeamBoardItem(itemId);
+      if (!cancelled.boardItem) return { ok: false, error: `Board item ${itemId} not found` };
+      return { ok: true, boardItem: cancelled.boardItem, queueTask: cancelled.queueTask, queueRuns: cancelled.queueRuns };
+    }
+
+    case "team.board.item.set_review_status": {
+      const itemId = stringValue(req.itemId) ?? stringValue(req.boardItemId) ?? stringValue(req.id);
+      const reviewStatus = boardReviewStatusValue(req.reviewStatus);
+      if (!itemId || !reviewStatus) return { ok: false, error: "Missing required: itemId, reviewStatus" };
+      const boardItem = setTeamBoardReviewStatus({
+        itemId,
+        reviewStatus,
+        reviewFeedback: stringValue(req.reviewFeedback),
+      });
+      if (!boardItem) return { ok: false, error: `Board item ${itemId} not found` };
+      return { ok: true, boardItem };
     }
 
     case "team.task.create": {
