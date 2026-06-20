@@ -14,10 +14,12 @@ function provider(id: string) {
   return entry;
 }
 
-const originalFlag = process.env.OPENVIDE_ENABLE_OPENCODE_PROVIDER;
+const originalOpenCodeFlag = process.env.OPENVIDE_ENABLE_OPENCODE_PROVIDER;
+const originalOpenHandsFlag = process.env.OPENVIDE_ENABLE_OPENHANDS_PROVIDER;
 
 try {
   delete process.env.OPENVIDE_ENABLE_OPENCODE_PROVIDER;
+  delete process.env.OPENVIDE_ENABLE_OPENHANDS_PROVIDER;
   const disabledOpenCode = provider("opencode");
   assert.equal(disabledOpenCode.available, true);
   assert.equal(disabledOpenCode.enabled, false);
@@ -37,6 +39,17 @@ try {
   assert.equal(openHands.available, true);
   assert.equal(openHands.enabled, false);
   assert.equal(openHands.executable, false);
+  assert.equal(openHands.status, "installed-but-disabled");
+  assert.equal(getProviderAdapter("openhands"), undefined);
+
+  process.env.OPENVIDE_ENABLE_OPENHANDS_PROVIDER = "1";
+  const enabledOpenHands = provider("openhands");
+  assert.equal(enabledOpenHands.available, true);
+  assert.equal(enabledOpenHands.enabled, true);
+  assert.equal(enabledOpenHands.executable, true);
+  assert.equal(enabledOpenHands.status, "enabled");
+  assert.equal(enabledOpenHands.modelOverride, false);
+  assert.equal(getProviderAdapter("openhands")?.provider, "openhands");
 
   process.env.OPENVIDE_ENABLE_OPENCODE_PROVIDER = "1";
   const unavailableOpenCode = listProviderRegistryEntries({
@@ -47,10 +60,24 @@ try {
   assert.equal(unavailableOpenCode.available, false);
   assert.equal(unavailableOpenCode.executable, false);
   assert.equal(unavailableOpenCode.status, "unavailable");
+
+  const unavailableOpenHands = listProviderRegistryEntries({
+    ...installedTools,
+    openhands: { available: false },
+  }).find((item) => item.id === "openhands");
+  assert.ok(unavailableOpenHands);
+  assert.equal(unavailableOpenHands.available, false);
+  assert.equal(unavailableOpenHands.executable, false);
+  assert.equal(unavailableOpenHands.status, "unavailable");
 } finally {
-  if (originalFlag === undefined) {
+  if (originalOpenCodeFlag === undefined) {
     delete process.env.OPENVIDE_ENABLE_OPENCODE_PROVIDER;
   } else {
-    process.env.OPENVIDE_ENABLE_OPENCODE_PROVIDER = originalFlag;
+    process.env.OPENVIDE_ENABLE_OPENCODE_PROVIDER = originalOpenCodeFlag;
+  }
+  if (originalOpenHandsFlag === undefined) {
+    delete process.env.OPENVIDE_ENABLE_OPENHANDS_PROVIDER;
+  } else {
+    process.env.OPENVIDE_ENABLE_OPENHANDS_PROVIDER = originalOpenHandsFlag;
   }
 }

@@ -119,6 +119,7 @@ function snapshotBridgeConfig(config: BridgeConfig): BridgeConfigSnapshot {
 }
 
 const DETECTABLE_TOOLS = ["claude", "codex", "gemini", "opencode", "openhands"];
+const OPENHANDS_COMMAND_ENV = "OPENVIDE_OPENHANDS_COMMAND";
 
 function firstLines(text: string, maxLines: number, maxChars: number): string | undefined {
   const lines = text
@@ -198,6 +199,11 @@ async function detectInstalledTools(): Promise<Record<string, ProviderDetectionI
       try {
         const command = await detectCommand(tool);
         if (!command) {
+          const override = tool === "openhands" ? process.env[OPENHANDS_COMMAND_ENV]?.trim() : undefined;
+          if (override) {
+            results[tool] = await detectOpenHands(override);
+            return;
+          }
           results[tool] = { available: false };
           return;
         }

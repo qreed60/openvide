@@ -913,6 +913,8 @@ function summarizeProviderDiagnostics(result: ProviderExecutionResult): string |
     diagnostics.error ? `error=${diagnostics.error}` : undefined,
     diagnostics.stdoutTail ? `stdoutTail=${diagnostics.stdoutTail.replace(/\s+/g, " ").trim()}` : undefined,
     diagnostics.stderrTail ? `stderrTail=${diagnostics.stderrTail.replace(/\s+/g, " ").trim()}` : undefined,
+    typeof diagnostics.parsedAssistantEventCount === "number" ? `parsedAssistantEventCount=${diagnostics.parsedAssistantEventCount}` : undefined,
+    diagnostics.conversationId ? `conversationId=${diagnostics.conversationId}` : undefined,
   ].filter(Boolean);
   return parts.join(" | ");
 }

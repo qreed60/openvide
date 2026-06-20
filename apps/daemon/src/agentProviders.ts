@@ -47,6 +47,8 @@ export interface ProviderExecutionResult extends ProviderExecutionCompletion {
     stdoutTail?: string;
     stderr?: string;
     stderrTail?: string;
+    parsedAssistantEventCount?: number;
+    conversationId?: string;
     timedOut?: boolean;
   };
 }
@@ -93,11 +95,22 @@ const cliCapabilities = (overrides: Partial<ProviderCapabilities> = {}): Provide
 const OPENCODE_ENABLE_FLAG = "OPENVIDE_ENABLE_OPENCODE_PROVIDER";
 const OPENCODE_COMMAND_ENV = "OPENVIDE_OPENCODE_COMMAND";
 const OPENCODE_EXECUTION_TIMEOUT_MS = 5 * 60 * 1000;
+const OPENHANDS_ENABLE_FLAG = "OPENVIDE_ENABLE_OPENHANDS_PROVIDER";
+const OPENHANDS_COMMAND_ENV = "OPENVIDE_OPENHANDS_COMMAND";
+const OPENHANDS_EXECUTION_TIMEOUT_MS = 8 * 60 * 1000;
 const DIAGNOSTIC_TAIL_CHARS = 4000;
 
-export function isOpenCodeProviderEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const value = (env[OPENCODE_ENABLE_FLAG] ?? "").trim().toLowerCase();
+function envFlagEnabled(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = (env[name] ?? "").trim().toLowerCase();
   return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+export function isOpenCodeProviderEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlagEnabled(OPENCODE_ENABLE_FLAG, env);
+}
+
+export function isOpenHandsProviderEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlagEnabled(OPENHANDS_ENABLE_FLAG, env);
 }
 
 function failedExecution(
@@ -189,11 +202,11 @@ function sanitizeProcessError(error: string | undefined, prompt: string): string
   return error.split(prompt).join(`<prompt:${prompt.length} chars>`);
 }
 
-function resolveOpenCodeCommand(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
-  const override = env[OPENCODE_COMMAND_ENV]?.trim();
+function resolveCommand(commandEnv: string, executableName: string, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const override = env[commandEnv]?.trim();
   if (override) return Promise.resolve(override);
   return new Promise((resolve) => {
-    child_process.execFile("sh", ["-lc", "command -v opencode"], { timeout: 1500, maxBuffer: 4096 }, (err, stdout) => {
+    child_process.execFile("sh", ["-lc", `command -v ${executableName}`], { timeout: 1500, maxBuffer: 4096 }, (err, stdout) => {
       if (err) {
         resolve(undefined);
         return;
@@ -202,6 +215,14 @@ function resolveOpenCodeCommand(env: NodeJS.ProcessEnv = process.env): Promise<s
       resolve(command || undefined);
     });
   });
+}
+
+function resolveOpenCodeCommand(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  return resolveCommand(OPENCODE_COMMAND_ENV, "opencode", env);
+}
+
+function resolveOpenHandsCommand(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  return resolveCommand(OPENHANDS_COMMAND_ENV, "openhands", env);
 }
 
 function execFileCaptured(
@@ -331,6 +352,260 @@ export const opencodeProviderAdapter: ProviderAdapter = {
   },
 };
 
+function openHandsDiagnosticArgs(prompt: string): string[] {
+  return [
+    "-t",
+    `<prompt:${prompt.length} chars>`,
+    "--headless",
+    "--json",
+    "--always-approve",
+    "--exit-without-confirmation",
+  ];
+}
+
+function maybeJsonObjectFromLine(line: string): unknown | undefined {
+  const trimmed = stripAnsi(line).trim();
+  if (!trimmed) return undefined;
+  const candidates = [trimmed];
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as unknown;
+    } catch {
+      // Continue looking for parseable JSON within noisy output lines.
+    }
+  }
+  return undefined;
+}
+
+function valueAtPath(value: unknown, pathParts: string[]): unknown {
+  let current = value;
+  for (const part of pathParts) {
+    if (!current || typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+function textFromUnknown(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (!value || typeof value !== "object") return "";
+  if (Array.isArray(value)) {
+    return value.map(textFromUnknown).filter(Boolean).join("\n").trim();
+  }
+  const record = value as Record<string, unknown>;
+  if (record.type === "text" && typeof record.text === "string") return record.text.trim();
+  return [
+    record.text,
+    record.content,
+    record.message,
+    record.body,
+  ].map(textFromUnknown).filter(Boolean).join("\n").trim();
+}
+
+function extractOpenHandsEventText(event: unknown): string {
+  const candidatePaths = [
+    ["message"],
+    ["message", "content"],
+    ["message", "text"],
+    ["llm_message", "content"],
+    ["llm_message", "text"],
+    ["content"],
+    ["text"],
+    ["body"],
+    ["payload", "message"],
+    ["payload", "content"],
+    ["payload", "text"],
+    ["data", "message"],
+    ["data", "content"],
+    ["data", "text"],
+  ];
+  return candidatePaths
+    .map((pathParts) => textFromUnknown(valueAtPath(event, pathParts)))
+    .find((text) => text.length > 0) ?? "";
+}
+
+function stringField(event: unknown, paths: string[][]): string {
+  for (const pathParts of paths) {
+    const value = valueAtPath(event, pathParts);
+    if (typeof value === "string") return value;
+  }
+  return "";
+}
+
+function isOpenHandsAssistantMessageEvent(event: unknown): boolean {
+  const eventKind = stringField(event, [
+    ["type"],
+    ["event"],
+    ["event_type"],
+    ["kind"],
+    ["class"],
+    ["name"],
+  ]).toLowerCase();
+  const source = stringField(event, [
+    ["source"],
+    ["role"],
+    ["sender"],
+    ["author"],
+    ["message", "role"],
+    ["llm_message", "role"],
+    ["payload", "source"],
+    ["data", "source"],
+  ]).toLowerCase();
+  const looksLikeMessageEvent = !eventKind || /message/.test(eventKind);
+  const fromAssistant = source === "assistant" || source === "agent" || source === "openhands";
+  return looksLikeMessageEvent && fromAssistant;
+}
+
+function isOpenHandsNoiseText(text: string): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  return !normalized
+    || normalized === "agent is working"
+    || normalized === "goodbye"
+    || normalized.startsWith("agent is working")
+    || normalized.startsWith("conversation summary")
+    || normalized.startsWith("conversation id")
+    || normalized.startsWith("resume id");
+}
+
+function conversationIdFromEvent(event: unknown): string | undefined {
+  const value = stringField(event, [
+    ["conversation_id"],
+    ["conversationId"],
+    ["conversation", "id"],
+    ["session_id"],
+    ["sessionId"],
+    ["resume_id"],
+    ["resumeId"],
+    ["payload", "conversation_id"],
+    ["payload", "conversationId"],
+    ["data", "conversation_id"],
+    ["data", "conversationId"],
+  ]).trim();
+  return value || undefined;
+}
+
+function conversationIdFromText(text: string): string | undefined {
+  const clean = stripAnsi(text);
+  const patterns = [
+    /conversation(?:\s+id|\s*\/\s*resume\s+id)?\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9._-]{5,})/i,
+    /resume\s+id\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9._-]{5,})/i,
+  ];
+  for (const pattern of patterns) {
+    const match = clean.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return undefined;
+}
+
+function parseOpenHandsStdout(stdout: string): { finalText: string; assistantEventCount: number; conversationId?: string } {
+  let finalText = "";
+  let assistantEventCount = 0;
+  let conversationId = conversationIdFromText(stdout);
+
+  for (const line of stdout.split(/\r?\n/)) {
+    const event = maybeJsonObjectFromLine(line);
+    if (!event) continue;
+    conversationId = conversationIdFromEvent(event) ?? conversationId;
+    if (!isOpenHandsAssistantMessageEvent(event)) continue;
+    const text = extractOpenHandsEventText(event);
+    if (isOpenHandsNoiseText(text)) continue;
+    assistantEventCount += 1;
+    finalText = text;
+  }
+
+  return {
+    finalText: finalText.trim(),
+    assistantEventCount,
+    conversationId,
+  };
+}
+
+export const openHandsProviderAdapter: ProviderAdapter = {
+  provider: "openhands",
+  label: "OpenHands",
+  capabilities: {
+    canEdit: true,
+    canReview: true,
+    supportsVision: false,
+    supportsLongRunning: true,
+    supportsStatusPolling: false,
+    supportsModelOverride: false,
+  },
+  async execute(request) {
+    const { member, prompt, cwd } = request;
+    if (!isOpenHandsProviderEnabled()) {
+      return failedExecution("openhands", member.sessionId, `OpenHands provider is installed but disabled. Set ${OPENHANDS_ENABLE_FLAG}=1 to enable execution.`);
+    }
+
+    const command = await resolveOpenHandsCommand();
+    if (!command) {
+      return failedExecution("openhands", member.sessionId, "OpenHands provider is enabled but the openhands executable was not found");
+    }
+
+    const args = ["-t", prompt, "--headless", "--json", "--always-approve", "--exit-without-confirmation"];
+    const diagnosticsBase = {
+      command,
+      args: openHandsDiagnosticArgs(prompt),
+      promptLength: prompt.length,
+      modelArgApplied: false,
+      cwd,
+      timeoutMs: OPENHANDS_EXECUTION_TIMEOUT_MS,
+    };
+
+    log(
+      "[openhands] starting",
+      `command=${command}`,
+      `cwd=${cwd ?? ""}`,
+      `promptLength=${prompt.length}`,
+      "modelArgApplied=false",
+      `timeoutMs=${OPENHANDS_EXECUTION_TIMEOUT_MS}`,
+    );
+
+    const result = await execFileCaptured(command, args, cwd, OPENHANDS_EXECUTION_TIMEOUT_MS);
+    const parsed = parseOpenHandsStdout(result.stdout);
+    const diagnostics = {
+      ...diagnosticsBase,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      error: sanitizeProcessError(result.error, prompt),
+      stdout: result.stdout,
+      stdoutTail: tailText(result.stdout),
+      stderr: result.stderr,
+      stderrTail: tailText(result.stderr),
+      parsedAssistantEventCount: parsed.assistantEventCount,
+      conversationId: parsed.conversationId,
+      timedOut: result.timedOut,
+    };
+
+    if (result.timedOut) {
+      return failedExecution("openhands", member.sessionId, `OpenHands provider timed out after ${OPENHANDS_EXECUTION_TIMEOUT_MS}ms`, diagnostics);
+    }
+    if (result.exitCode !== 0) {
+      const stderr = stripAnsi(result.stderr).trim();
+      const error = stderr || sanitizeProcessError(result.error, prompt) || `OpenHands provider exited with code ${result.exitCode}`;
+      return failedExecution("openhands", member.sessionId, error, diagnostics);
+    }
+    if (!parsed.finalText) {
+      return failedExecution("openhands", member.sessionId, "OpenHands provider exited successfully but no assistant MessageEvent text was found", diagnostics);
+    }
+
+    return {
+      provider: "openhands",
+      sessionId: member.sessionId,
+      ok: true,
+      status: "idle",
+      responseText: parsed.finalText,
+      errorText: stripAnsi(result.stderr).trim() || undefined,
+      diagnostics,
+    };
+  },
+};
+
 export const codexProviderAdapter: ProviderAdapter = makeCliProviderAdapter(
   "codex",
   "Codex",
@@ -387,6 +662,7 @@ const plannedProviders: ProviderRegistryEntry[] = [
 export function getProviderAdapter(provider: string | undefined): ProviderAdapter | undefined {
   if (!provider) return undefined;
   if (provider === "opencode") return isOpenCodeProviderEnabled() ? opencodeProviderAdapter : undefined;
+  if (provider === "openhands") return isOpenHandsProviderEnabled() ? openHandsProviderAdapter : undefined;
   return cliProviderAdapters.get(provider as Tool);
 }
 
@@ -438,6 +714,25 @@ function openCodeProviderEntry(installedTools: Record<string, boolean | Provider
   };
 }
 
+function openHandsProviderEntry(installedTools: Record<string, boolean | ProviderDetectionInfo>): ProviderRegistryEntry {
+  const detection = normalizeDetection(installedTools, "openhands");
+  const available = detection.available === true;
+  const enabled = isOpenHandsProviderEnabled();
+  return {
+    id: "openhands",
+    label: "OpenHands",
+    type: enabled ? "cli" : "planned",
+    status: available ? (enabled ? "enabled" : "installed-but-disabled") : "unavailable",
+    available,
+    enabled,
+    executable: available && enabled,
+    planned: !enabled,
+    modelOverride: false,
+    capabilities: openHandsProviderAdapter.capabilities,
+    detection,
+  };
+}
+
 export function listProviderRegistryEntries(installedTools: Record<string, boolean | ProviderDetectionInfo>): ProviderRegistryEntry[] {
   const executable = [...cliProviderAdapters.values()].map((adapter) => {
     const detection = normalizeDetection(installedTools, adapter.provider);
@@ -460,8 +755,10 @@ export function listProviderRegistryEntries(installedTools: Record<string, boole
   return [
     ...executable,
     openCodeProviderEntry(installedTools),
+    openHandsProviderEntry(installedTools),
     ...plannedProviders
       .filter((entry) => entry.id !== "opencode")
+      .filter((entry) => entry.id !== "openhands")
       .map((entry) => plannedProviderEntry(entry, installedTools)),
   ];
 }
@@ -474,6 +771,13 @@ export async function executeProviderTurn(request: ProviderExecutionRequest): Pr
         "opencode",
         request.member.sessionId,
         `OpenCode provider is installed but disabled. Set ${OPENCODE_ENABLE_FLAG}=1 to enable execution.`,
+      );
+    }
+    if (request.member.tool === "openhands" && !isOpenHandsProviderEnabled()) {
+      return failedExecution(
+        "openhands",
+        request.member.sessionId,
+        `OpenHands provider is installed but disabled. Set ${OPENHANDS_ENABLE_FLAG}=1 to enable execution.`,
       );
     }
     return failedExecution(
