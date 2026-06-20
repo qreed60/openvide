@@ -15,6 +15,7 @@ import { daemonDir, newId, nowISO, log, logError } from "./utils.js";
 import * as sm from "./sessionManager.js";
 import { runTeamOrchestrator } from "./teamOrchestrator.js";
 import { executeProviderTurn } from "./agentProviders.js";
+import type { ProviderExecutionResult } from "./agentProviders.js";
 import { isExecutableTeamTool } from "./teamMetadata.js";
 import { getCoordinatorMember, normalizeTeamRole, roleMatches } from "./teamRoles.js";
 import type {
@@ -847,6 +848,7 @@ function invokeMemberTurn(member: TeamMember, prompt: string, cwd?: string): Pro
         status: result.status,
         responseText: result.responseText,
         errorText: result.errorText ?? result.error,
+        diagnosticsSummary: summarizeProviderDiagnostics(result),
       };
     });
   } catch (err) {
@@ -891,7 +893,29 @@ type SessionCompletion = {
   status: "idle" | "failed" | "cancelled" | "interrupted";
   responseText: string;
   errorText?: string;
+  diagnosticsSummary?: string;
 };
+
+function summarizeProviderDiagnostics(result: ProviderExecutionResult): string | undefined {
+  const diagnostics = result.diagnostics;
+  if (!diagnostics) return undefined;
+  const parts = [
+    `provider=${result.provider}`,
+    diagnostics.command ? `command=${diagnostics.command}` : undefined,
+    diagnostics.cwd ? `cwd=${diagnostics.cwd}` : undefined,
+    diagnostics.args ? `args=${diagnostics.args.join(" ")}` : undefined,
+    typeof diagnostics.promptLength === "number" ? `promptLength=${diagnostics.promptLength}` : undefined,
+    typeof diagnostics.modelArgApplied === "boolean" ? `modelArgApplied=${diagnostics.modelArgApplied}` : undefined,
+    typeof diagnostics.timeoutMs === "number" ? `timeoutMs=${diagnostics.timeoutMs}` : undefined,
+    typeof diagnostics.exitCode !== "undefined" ? `exitCode=${diagnostics.exitCode}` : undefined,
+    diagnostics.signal ? `signal=${diagnostics.signal}` : undefined,
+    diagnostics.timedOut ? "timedOut=true" : undefined,
+    diagnostics.error ? `error=${diagnostics.error}` : undefined,
+    diagnostics.stdoutTail ? `stdoutTail=${diagnostics.stdoutTail.replace(/\s+/g, " ").trim()}` : undefined,
+    diagnostics.stderrTail ? `stderrTail=${diagnostics.stderrTail.replace(/\s+/g, " ").trim()}` : undefined,
+  ].filter(Boolean);
+  return parts.join(" | ");
+}
 
 const activeWatchers = new Map<string, (result: SessionCompletion) => void>();
 

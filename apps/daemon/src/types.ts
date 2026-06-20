@@ -411,6 +411,7 @@ export interface TeamMessageOrchestration {
     status?: "started" | "completed" | "blocked" | "failed";
     durationMs?: number;
     summary?: string;
+    diagnostics?: string;
   }>;
 }
 

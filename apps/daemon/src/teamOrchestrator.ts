@@ -47,6 +47,7 @@ interface SessionCompletion {
   status: "idle" | "failed" | "cancelled" | "interrupted";
   responseText: string;
   errorText?: string;
+  diagnosticsSummary?: string;
 }
 
 interface OrchestratorRuntime {
@@ -356,6 +357,15 @@ function resultSummary(resultBlock: string): string {
   return summarizeText(match?.[1] ?? resultBlock);
 }
 
+function completionText(completion: SessionCompletion): string {
+  return (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+}
+
+function completionSummary(text: string, completion: SessionCompletion): string {
+  const diagnostics = completion.diagnosticsSummary ? `Diagnostics: ${completion.diagnosticsSummary}` : "";
+  return [text, diagnostics].filter(Boolean).join("\n");
+}
+
 function eventMember(member: TeamMember): Pick<import("./orchestratorRunStore.js").OrchestratorRunEvent, "memberName" | "role" | "tool" | "model"> {
   return {
     memberName: member.name,
@@ -397,14 +407,15 @@ async function leadTurn(state: TeamOrchestratorState): Promise<Partial<TeamOrche
     lead,
     buildLeadInitialPrompt(runtime.team, lead, runtime.userText, runtime.summarizePlan, runtime.summarizeBoard),
   );
-  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  const response = completionText(completion);
   appendOrchestratorEvent(state.runId, {
     teamId: runtime.team.id,
     type: "lead_turn_completed",
     ...eventMember(lead),
     status: completion.status === "idle" ? "completed" : "failed",
     durationMs: Date.now() - startedAt,
-    summary: response || `Lead turn ended with status ${completion.status}.`,
+    summary: completionSummary(response || `Lead turn ended with status ${completion.status}.`, completion),
+    diagnostics: completion.diagnosticsSummary,
   });
   if (completion.status !== "idle") {
     return {
@@ -436,14 +447,15 @@ async function leadRepairTurn(state: TeamOrchestratorState): Promise<Partial<Tea
     lead,
     buildRepairPrompt(state.parseError ?? "Invalid OV_DELEGATE JSON", state.lastLeadResponse ?? ""),
   );
-  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  const response = completionText(completion);
   appendOrchestratorEvent(state.runId, {
     teamId: runtime.team.id,
     type: "lead_turn_completed",
     ...eventMember(lead),
     status: completion.status === "idle" ? "completed" : "failed",
     durationMs: Date.now() - startedAt,
-    summary: response || `Lead repair ended with status ${completion.status}.`,
+    summary: completionSummary(response || `Lead repair ended with status ${completion.status}.`, completion),
+    diagnostics: completion.diagnosticsSummary,
   });
   return {
     lastLeadResponse: response || state.lastLeadResponse,
@@ -524,7 +536,7 @@ async function runDelegations(state: TeamOrchestratorState): Promise<Partial<Tea
     });
     const startedAt = Date.now();
     const completion = await runtime.invokeMember(member, buildDelegatedTaskPrompt(runtime.team, member, task));
-    const raw = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+    const raw = completionText(completion);
     if (completion.status !== "idle") {
       const status = raw.toLowerCase().includes("already running") || raw.toLowerCase().includes(" is running")
         ? "blocked"
@@ -539,7 +551,8 @@ async function runDelegations(state: TeamOrchestratorState): Promise<Partial<Tea
         ...eventMember(member),
         status,
         durationMs: Date.now() - startedAt,
-        summary: resultSummary(result.resultBlock),
+        summary: completionSummary(resultSummary(result.resultBlock), completion),
+        diagnostics: completion.diagnosticsSummary,
       });
       continue;
     }
@@ -563,7 +576,8 @@ async function runDelegations(state: TeamOrchestratorState): Promise<Partial<Tea
       ...eventMember(member),
       status: result.status,
       durationMs: Date.now() - startedAt,
-      summary: resultSummary(result.resultBlock),
+      summary: completionSummary(resultSummary(result.resultBlock), completion),
+      diagnostics: completion.diagnosticsSummary,
     });
     log(`team.orchestrator.result team=${runtime.team.id} from=${task.to}`);
   }
@@ -592,14 +606,15 @@ async function leadReviewTurn(state: TeamOrchestratorState): Promise<Partial<Tea
   });
   const startedAt = Date.now();
   const completion = await runtime.invokeMember(lead, buildLeadReviewPrompt(state.results ?? []));
-  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  const response = completionText(completion);
   appendOrchestratorEvent(state.runId, {
     teamId: runtime.team.id,
     type: "lead_turn_completed",
     ...eventMember(lead),
     status: completion.status === "idle" ? "completed" : "failed",
     durationMs: Date.now() - startedAt,
-    summary: response || `Lead review ended with status ${completion.status}.`,
+    summary: completionSummary(response || `Lead review ended with status ${completion.status}.`, completion),
+    diagnostics: completion.diagnosticsSummary,
   });
   if (completion.status !== "idle") {
     return {
@@ -634,14 +649,15 @@ async function forceFinal(state: TeamOrchestratorState): Promise<Partial<TeamOrc
   });
   const startedAt = Date.now();
   const completion = await runtime.invokeMember(lead, buildForceFinalPrompt());
-  const response = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+  const response = completionText(completion);
   appendOrchestratorEvent(state.runId, {
     teamId: runtime.team.id,
     type: "lead_turn_completed",
     ...eventMember(lead),
     status: completion.status === "idle" ? "completed" : "failed",
     durationMs: Date.now() - startedAt,
-    summary: response || `Forced final lead turn ended with status ${completion.status}.`,
+    summary: completionSummary(response || `Forced final lead turn ended with status ${completion.status}.`, completion),
+    diagnostics: completion.diagnosticsSummary,
   });
   const finalText = parseFinalBlock(response);
   if (finalText) {

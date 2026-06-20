@@ -1,6 +1,7 @@
 import * as child_process from "node:child_process";
 import * as sm from "./sessionManager.js";
 import type { IpcResponse, TeamMember, TeamTool, Tool } from "./types.js";
+import { log } from "./utils.js";
 
 export type AgentProvider = TeamTool;
 export type ProviderStatus = "enabled" | "planned" | "installed-but-not-executable" | "installed-but-disabled" | "disabled" | "unavailable";
@@ -35,10 +36,17 @@ export interface ProviderExecutionResult extends ProviderExecutionCompletion {
   diagnostics?: {
     command?: string;
     args?: string[];
+    promptLength?: number;
+    modelArgApplied?: boolean;
+    timeoutMs?: number;
     cwd?: string;
     exitCode?: number | null;
+    signal?: NodeJS.Signals | null;
+    error?: string;
     stdout?: string;
+    stdoutTail?: string;
     stderr?: string;
+    stderrTail?: string;
     timedOut?: boolean;
   };
 }
@@ -83,7 +91,9 @@ const cliCapabilities = (overrides: Partial<ProviderCapabilities> = {}): Provide
 });
 
 const OPENCODE_ENABLE_FLAG = "OPENVIDE_ENABLE_OPENCODE_PROVIDER";
+const OPENCODE_COMMAND_ENV = "OPENVIDE_OPENCODE_COMMAND";
 const OPENCODE_EXECUTION_TIMEOUT_MS = 5 * 60 * 1000;
+const DIAGNOSTIC_TAIL_CHARS = 4000;
 
 export function isOpenCodeProviderEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const value = (env[OPENCODE_ENABLE_FLAG] ?? "").trim().toLowerCase();
@@ -160,7 +170,28 @@ function supportsOpenCodeModelArg(model: string | undefined): model is string {
   return /^[^/\s]+\/[^/\s]+$/.test(model);
 }
 
-function resolveOpenCodeCommand(): Promise<string | undefined> {
+function tailText(text: string, maxChars = DIAGNOSTIC_TAIL_CHARS): string {
+  if (text.length <= maxChars) return text;
+  return text.slice(text.length - maxChars);
+}
+
+function diagnosticArgs(model: string | undefined, prompt: string): string[] {
+  const args = ["run"];
+  if (supportsOpenCodeModelArg(model)) {
+    args.push("--model", model);
+  }
+  args.push(`<prompt:${prompt.length} chars>`);
+  return args;
+}
+
+function sanitizeProcessError(error: string | undefined, prompt: string): string | undefined {
+  if (!error) return undefined;
+  return error.split(prompt).join(`<prompt:${prompt.length} chars>`);
+}
+
+function resolveOpenCodeCommand(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const override = env[OPENCODE_COMMAND_ENV]?.trim();
+  if (override) return Promise.resolve(override);
   return new Promise((resolve) => {
     child_process.execFile("sh", ["-lc", "command -v opencode"], { timeout: 1500, maxBuffer: 4096 }, (err, stdout) => {
       if (err) {
@@ -178,16 +209,44 @@ function execFileCaptured(
   args: string[],
   cwd: string | undefined,
   timeout: number,
-): Promise<{ exitCode: number | null; stdout: string; stderr: string; error?: string; timedOut: boolean }> {
+): Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; error?: string; timedOut: boolean }> {
   return new Promise((resolve) => {
-    child_process.execFile(command, args, { cwd, timeout, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-      const nodeErr = err as (NodeJS.ErrnoException & { killed?: boolean; signal?: NodeJS.Signals }) | null;
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let settled = false;
+    let timedOut = false;
+    let spawnError: string | undefined;
+
+    const child = child_process.spawn(command, args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeout);
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrChunks.push(chunk);
+    });
+    child.on("error", (err) => {
+      spawnError = err.message;
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       resolve({
-        exitCode: typeof nodeErr?.code === "number" ? nodeErr.code : nodeErr ? null : 0,
-        stdout: stdout.toString(),
-        stderr: stderr.toString(),
-        error: nodeErr ? nodeErr.message : undefined,
-        timedOut: Boolean(nodeErr?.killed && nodeErr?.signal === "SIGTERM"),
+        exitCode: code,
+        signal,
+        stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+        error: spawnError,
+        timedOut,
       });
     });
   });
@@ -220,15 +279,34 @@ export const opencodeProviderAdapter: ProviderAdapter = {
       args.push("--model", member.model);
     }
     args.push(prompt);
+    const diagnosticsBase = {
+      command,
+      args: diagnosticArgs(member.model, prompt),
+      promptLength: prompt.length,
+      modelArgApplied: supportsOpenCodeModelArg(member.model),
+      cwd,
+      timeoutMs: OPENCODE_EXECUTION_TIMEOUT_MS,
+    };
+
+    log(
+      "[opencode] starting",
+      `command=${command}`,
+      `cwd=${cwd ?? ""}`,
+      `promptLength=${prompt.length}`,
+      `modelArgApplied=${diagnosticsBase.modelArgApplied ? "true" : "false"}`,
+      `timeoutMs=${OPENCODE_EXECUTION_TIMEOUT_MS}`,
+    );
 
     const result = await execFileCaptured(command, args, cwd, OPENCODE_EXECUTION_TIMEOUT_MS);
     const diagnostics = {
-      command,
-      args,
-      cwd,
+      ...diagnosticsBase,
       exitCode: result.exitCode,
+      signal: result.signal,
+      error: sanitizeProcessError(result.error, prompt),
       stdout: result.stdout,
+      stdoutTail: tailText(result.stdout),
       stderr: result.stderr,
+      stderrTail: tailText(result.stderr),
       timedOut: result.timedOut,
     };
 
@@ -237,7 +315,7 @@ export const opencodeProviderAdapter: ProviderAdapter = {
     }
     if (result.exitCode !== 0) {
       const stderr = stripAnsi(result.stderr).trim();
-      const error = stderr || result.error || `OpenCode provider exited with code ${result.exitCode}`;
+      const error = stderr || sanitizeProcessError(result.error, prompt) || `OpenCode provider exited with code ${result.exitCode}`;
       return failedExecution("opencode", member.sessionId, error, diagnostics);
     }
 

@@ -29,6 +29,7 @@ export interface OrchestratorRunEvent {
   status?: OrchestratorEventStatus;
   durationMs?: number;
   summary?: string;
+  diagnostics?: string;
 }
 
 export interface OrchestratorRunRecord {
@@ -74,6 +75,7 @@ export interface OrchestratorRunTimelineEvent {
   status?: OrchestratorEventStatus;
   durationMs?: number;
   summary?: string;
+  diagnostics?: string;
 }
 
 export interface OrchestratorRunMemberSummary {
@@ -182,6 +184,7 @@ function timelineEvent(event: OrchestratorRunEvent): OrchestratorRunTimelineEven
     status: event.status,
     durationMs: event.durationMs,
     summary: compactSummary(event.summary),
+    diagnostics: compactSummary(event.diagnostics, 2000),
   };
 }
 
@@ -319,6 +322,7 @@ export function createMessageOrchestration(runId: string): TeamMessageOrchestrat
       status: event.status,
       durationMs: event.durationMs,
       summary: event.summary,
+      diagnostics: event.diagnostics,
     }));
   return {
     runId: run.runId,
