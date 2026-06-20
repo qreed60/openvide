@@ -18,9 +18,18 @@ import * as sched from "./scheduleManager.js";
 import { detailOrchestratorRun, getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
 import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
 import { getTeamMetadata } from "./teamMetadata.js";
-import { getTeamQueueStatus } from "./teamQueueStore.js";
+import {
+  cancelTeamQueueTask,
+  createTeamQueueTask,
+  getTeamQueueRun,
+  getTeamQueueStatus,
+  getTeamQueueTask,
+  listTeamQueueRuns,
+  listTeamQueueTasks,
+} from "./teamQueueStore.js";
 import { getResourceStatus, listResourceStatus, modelResourceKey } from "./modelResourceScheduler.js";
 import type { ProviderDetectionInfo } from "./agentProviders.js";
+import type { TeamQueueTaskSource } from "./teamQueueTypes.js";
 
 const SOCKET_NAME = "daemon.sock";
 
@@ -117,6 +126,56 @@ function snapshotBridgeConfig(config: BridgeConfig): BridgeConfigSnapshot {
         : "last",
     evenAiPinnedSessionId: config.evenAiPinnedSessionId ?? "",
     currentEvenAiSessionId: config.currentEvenAiSessionId ?? "",
+  };
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parsed = value.map((item) => stringValue(item)).filter((item): item is string => Boolean(item));
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+function numberValue(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function taskSourceValue(value: unknown, fallback: TeamQueueTaskSource): TeamQueueTaskSource {
+  const source = stringValue(value);
+  if (source === "board" || source === "plan" || source === "chat" || source === "scheduler" || source === "manual") {
+    return source;
+  }
+  return fallback;
+}
+
+function queueAssignedMembers(req: IpcRequest): string[] | undefined {
+  return stringArrayValue(req.assignedMemberNames)
+    ?? stringArrayValue(req.assignedMembers)
+    ?? stringArrayValue(req.members)
+    ?? (stringValue(req.owner) ? [stringValue(req.owner)!] : undefined)
+    ?? (stringValue(req.to) && stringValue(req.to) !== "*" ? [stringValue(req.to)!] : undefined);
+}
+
+function planQueueMetadata(req: IpcRequest): Record<string, unknown> {
+  const mode = stringValue(req.mode);
+  const reviewMode = stringValue(req.reviewMode) ?? mode;
+  return {
+    reviewMode,
+    mode,
+    simple: reviewMode === "simple",
+    consensus: reviewMode === "consensus",
+    reviewers: stringArrayValue(req.reviewers),
+    maxIterations: typeof req.maxIterations === "number" ? req.maxIterations : undefined,
+  };
+}
+
+function chatQueueMetadata(req: IpcRequest): Record<string, unknown> {
+  return {
+    from: stringValue(req.from) ?? "user",
+    to: stringValue(req.to) ?? "*",
   };
 }
 
@@ -861,15 +920,41 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
 
     case "team.task.create": {
       const teamId = req.teamId as string | undefined;
-      const subject = req.subject as string | undefined;
-      const description = req.description as string ?? "";
+      const subject = stringValue(req.subject) ?? stringValue(req.title);
+      const description = stringValue(req.description) ?? stringValue(req.prompt) ?? "";
       const owner = req.owner as string | undefined;
       if (!teamId || !subject) {
         return { ok: false, error: "Missing required: teamId, subject" };
       }
       try {
-        const task = tm.createTask(teamId, subject, description, owner ?? "", req.dependencies as string[] | undefined);
-        return { ok: true, teamTask: task };
+        const source = taskSourceValue(req.source, "board");
+        let task: import("./types.js").TeamTask | undefined;
+        if (source === "board" || source === "manual") {
+          task = tm.createTask(teamId, subject, description, owner ?? "", req.dependencies as string[] | undefined, {
+            autoStart: false,
+          });
+        }
+        const queueCreated = createTeamQueueTask({
+          teamId,
+          source,
+          title: subject,
+          description,
+          assignedMemberNames: queueAssignedMembers(req),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.createdBy) ?? stringValue(req.from) ?? "user",
+          sourceRef: {
+            boardTaskId: stringValue(req.boardTaskId) ?? task?.id,
+            messageId: stringValue(req.messageId),
+            scheduleId: stringValue(req.scheduleId),
+          },
+          metadata: {
+            producerCommand: "team.task.create",
+            legacyOwner: stringValue(owner),
+            ...(source === "plan" ? planQueueMetadata(req) : {}),
+            ...(source === "chat" ? chatQueueMetadata(req) : {}),
+          },
+        });
+        return { ok: true, teamTask: task, queueTask: queueCreated.task, queueRun: queueCreated.run };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
@@ -893,7 +978,36 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
     case "team.task.list": {
       const teamId = req.teamId as string | undefined;
       if (!teamId) return { ok: false, error: "Missing required: teamId" };
-      return { ok: true, teamTasks: tm.listTasks(teamId) };
+      return { ok: true, teamTasks: tm.listTasks(teamId), queueTasks: listTeamQueueTasks(teamId) };
+    }
+
+    case "team.task.get": {
+      const taskId = stringValue(req.taskId) ?? stringValue(req.id);
+      if (!taskId) return { ok: false, error: "Missing required: taskId" };
+      const task = getTeamQueueTask(taskId);
+      if (!task) return { ok: false, error: `Queue task ${taskId} not found` };
+      return { ok: true, queueTask: task };
+    }
+
+    case "team.task.cancel": {
+      const taskId = stringValue(req.taskId) ?? stringValue(req.id);
+      if (!taskId) return { ok: false, error: "Missing required: taskId" };
+      const cancelled = cancelTeamQueueTask(taskId);
+      if (!cancelled.task) return { ok: false, error: `Queue task ${taskId} not found` };
+      return { ok: true, queueTask: cancelled.task, queueRuns: cancelled.runs };
+    }
+
+    case "team.run.list": {
+      const teamId = stringValue(req.teamId);
+      return { ok: true, queueRuns: listTeamQueueRuns(teamId) };
+    }
+
+    case "team.run.get": {
+      const runId = stringValue(req.runId) ?? stringValue(req.id);
+      if (!runId) return { ok: false, error: "Missing required: runId" };
+      const run = getTeamQueueRun(runId);
+      if (!run) return { ok: false, error: `Queue run ${runId} not found` };
+      return { ok: true, queueRun: run };
     }
 
     case "team.task.comment": {
@@ -932,6 +1046,36 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       return { ok: true, teamMessages: tm.listMessages(teamId, limit) };
     }
 
+    case "team.chat.queue": {
+      const teamId = stringValue(req.teamId);
+      const text = stringValue(req.text) ?? stringValue(req.prompt) ?? stringValue(req.message);
+      if (!teamId || !text) {
+        return { ok: false, error: "Missing required: teamId, text" };
+      }
+      try {
+        const title = stringValue(req.title) ?? `Team chat: ${text.slice(0, 80)}`;
+        const queued = createTeamQueueTask({
+          teamId,
+          source: "chat",
+          title,
+          description: text,
+          assignedMemberNames: queueAssignedMembers(req),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.from) ?? stringValue(req.createdBy) ?? "user",
+          sourceRef: {
+            messageId: stringValue(req.messageId),
+          },
+          metadata: {
+            producerCommand: "team.chat.queue",
+            ...chatQueueMetadata(req),
+          },
+        });
+        return { ok: true, queueTask: queued.task, queueRun: queued.run };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
     case "team.orchestrator.runs.list": {
       const limit = typeof req.limit === "number" ? req.limit : undefined;
       const teamId = typeof req.teamId === "string" ? req.teamId : undefined;
@@ -944,6 +1088,36 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       const run = getOrchestratorRun(runId);
       if (!run) return { ok: false, error: `Orchestrator run ${runId} not found` };
       return { ok: true, orchestratorRun: detailOrchestratorRun(run) };
+    }
+
+    case "team.plan.create": {
+      const teamId = stringValue(req.teamId);
+      const request = stringValue(req.request) ?? stringValue(req.prompt) ?? stringValue(req.description);
+      if (!teamId || !request) {
+        return { ok: false, error: "Missing required: teamId, request" };
+      }
+      try {
+        const queued = createTeamQueueTask({
+          teamId,
+          source: "plan",
+          title: stringValue(req.title) ?? `Plan request: ${request.slice(0, 80)}`,
+          description: request,
+          assignedMemberNames: queueAssignedMembers(req),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.createdBy) ?? "user",
+          sourceRef: {
+            planId: stringValue(req.planId),
+            planRevisionId: stringValue(req.planRevisionId),
+          },
+          metadata: {
+            producerCommand: "team.plan.create",
+            ...planQueueMetadata(req),
+          },
+        });
+        return { ok: true, queueTask: queued.task, queueRun: queued.run };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
     }
 
     case "team.plan.submit": {

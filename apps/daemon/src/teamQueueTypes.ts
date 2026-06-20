@@ -185,3 +185,15 @@ export interface TeamQueueStatusSummary {
   activeRunIds: string[];
   activeTurnIds: string[];
 }
+
+export interface CreateTeamQueueTaskInput {
+  teamId: string;
+  source: TeamQueueTaskSource;
+  title: string;
+  description?: string;
+  assignedMemberNames?: string[];
+  priority?: number;
+  createdBy?: string;
+  sourceRef?: TeamQueueTask["sourceRef"];
+  metadata?: Record<string, unknown>;
+}

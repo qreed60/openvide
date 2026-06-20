@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { daemonDir, nowISO } from "./utils.js";
+import { daemonDir, newId, nowISO } from "./utils.js";
 import type {
+  CreateTeamQueueTaskInput,
   TeamQueueResource,
   TeamQueueResourceStatus,
   TeamQueueRun,
@@ -190,6 +191,127 @@ export function upsertTeamQueueResource(resource: TeamQueueResource, options?: T
   return updateTeamQueueState((state) => {
     state.resources[resource.key] = resource;
   }, options);
+}
+
+function cleanString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+function cleanMembers(value: string[] | undefined): string[] {
+  return Array.isArray(value)
+    ? value.map((member) => member.trim()).filter((member) => member.length > 0)
+    : [];
+}
+
+export function createTeamQueueTask(
+  input: CreateTeamQueueTaskInput,
+  options?: TeamQueueStoreOptions,
+): { task: TeamQueueTask; run: TeamQueueRun; state: TeamQueueState } {
+  const teamId = cleanString(input.teamId);
+  const title = cleanString(input.title);
+  if (!teamId || !title) {
+    throw new Error("Missing required: teamId, title");
+  }
+
+  const now = nowISO();
+  const taskId = newId("queue_task");
+  const runId = newId("queue_run");
+  const route = cleanMembers(input.assignedMemberNames);
+  const priority = typeof input.priority === "number" && Number.isFinite(input.priority)
+    ? input.priority
+    : 50;
+
+  const task: TeamQueueTask = {
+    id: taskId,
+    teamId,
+    source: input.source,
+    status: "queued",
+    title,
+    description: cleanString(input.description),
+    createdAt: now,
+    updatedAt: now,
+    queuedAt: now,
+    createdBy: cleanString(input.createdBy),
+    sourceRef: input.sourceRef,
+    runIds: [runId],
+    priority,
+    metadata: input.metadata,
+  };
+
+  const run: TeamQueueRun = {
+    id: runId,
+    teamId,
+    taskId,
+    status: "queued",
+    route,
+    createdAt: now,
+    updatedAt: now,
+    queuedAt: now,
+    attempt: 1,
+    turnIds: [],
+    metadata: {
+      source: input.source,
+      priority,
+      ...(input.metadata ?? {}),
+    },
+  };
+
+  const state = updateTeamQueueState((draft) => {
+    draft.tasks[task.id] = task;
+    draft.runs[run.id] = run;
+  }, options);
+
+  return { task: state.tasks[task.id] ?? task, run: state.runs[run.id] ?? run, state };
+}
+
+export function listTeamQueueTasks(teamId?: string, options?: TeamQueueStoreOptions): TeamQueueTask[] {
+  return Object.values(loadTeamQueueState(options).tasks)
+    .filter((task) => belongsToTeam(task, teamId))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+export function getTeamQueueTask(taskId: string, options?: TeamQueueStoreOptions): TeamQueueTask | undefined {
+  return loadTeamQueueState(options).tasks[taskId];
+}
+
+export function cancelTeamQueueTask(
+  taskId: string,
+  options?: TeamQueueStoreOptions,
+): { task?: TeamQueueTask; runs: TeamQueueRun[]; state: TeamQueueState } {
+  const state = updateTeamQueueState((draft) => {
+    const task = draft.tasks[taskId];
+    if (!task) return;
+    const now = nowISO();
+    if (task.status === "queued" || task.status === "ready") {
+      task.status = "cancelled";
+      task.finishedAt = task.finishedAt ?? now;
+    }
+    task.updatedAt = now;
+    for (const runId of task.runIds) {
+      const run = draft.runs[runId];
+      if (!run) continue;
+      if (run.status === "queued" || run.status === "waiting_for_team_slot" || run.status === "waiting_for_model") {
+        run.status = "cancelled";
+        run.currentState = "cancelled";
+        run.finishedAt = run.finishedAt ?? now;
+      }
+      run.updatedAt = now;
+    }
+  }, options);
+  const task = state.tasks[taskId];
+  const runs = task ? task.runIds.map((runId) => state.runs[runId]).filter(Boolean) : [];
+  return { task, runs, state };
+}
+
+export function listTeamQueueRuns(teamId?: string, options?: TeamQueueStoreOptions): TeamQueueRun[] {
+  return Object.values(loadTeamQueueState(options).runs)
+    .filter((run) => belongsToTeam(run, teamId))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+export function getTeamQueueRun(runId: string, options?: TeamQueueStoreOptions): TeamQueueRun | undefined {
+  return loadTeamQueueState(options).runs[runId];
 }
 
 function increment<K extends string>(counts: Partial<Record<K, number>>, key: K): void {

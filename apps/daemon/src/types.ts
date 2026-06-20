@@ -1,5 +1,5 @@
 import type { TeamMetadata } from "./teamMetadata.js";
-import type { ModelResourceStatus, ModelResourceStatusSummary, TeamQueueStatusSummary } from "./teamQueueTypes.js";
+import type { ModelResourceStatus, ModelResourceStatusSummary, TeamQueueRun, TeamQueueStatusSummary, TeamQueueTask } from "./teamQueueTypes.js";
 
 // ── Session & State ──
 
@@ -251,6 +251,10 @@ export interface IpcResponse {
   teams?: TeamConfig[];
   teamTasks?: TeamTask[];
   teamTask?: TeamTask;
+  queueTasks?: TeamQueueTask[];
+  queueTask?: TeamQueueTask;
+  queueRuns?: TeamQueueRun[];
+  queueRun?: TeamQueueRun;
   teamMessages?: TeamMessage[];
   teamPlan?: TeamPlan;
   timedOut?: boolean;

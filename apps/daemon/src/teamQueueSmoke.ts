@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getTeamQueueStatus, loadTeamQueueState, saveTeamQueueState, updateTeamQueueState } from "./teamQueueStore.js";
+import {
+  cancelTeamQueueTask,
+  createTeamQueueTask,
+  getTeamQueueRun,
+  getTeamQueueStatus,
+  getTeamQueueTask,
+  listTeamQueueRuns,
+  listTeamQueueTasks,
+  loadTeamQueueState,
+  saveTeamQueueState,
+  updateTeamQueueState,
+} from "./teamQueueStore.js";
 import type { TeamQueueState } from "./teamQueueTypes.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openvide-team-queue-"));
@@ -117,4 +128,91 @@ assert.equal(teamStatus.tasks.total, 1);
 assert.equal(teamStatus.tasks.bySource.chat, 1);
 assert.equal(teamStatus.runs.total, 0);
 
-console.log(JSON.stringify({ ok: true, statePath, globalStatus, teamStatus }, null, 2));
+const board = createTeamQueueTask({
+  teamId: "team_producers",
+  source: "board",
+  title: "Board task",
+  description: "Implement a board item",
+  assignedMemberNames: ["Coder"],
+}, { statePath });
+assert.equal(board.task.status, "queued");
+assert.equal(board.task.source, "board");
+assert.equal(board.task.priority, 50);
+assert.deepEqual(board.run.route, ["Coder"]);
+assert.equal(board.run.status, "queued");
+assert.equal(board.run.startedAt, undefined);
+
+const plan = createTeamQueueTask({
+  teamId: "team_producers",
+  source: "plan",
+  title: "Plan request",
+  description: "Draft a consensus plan",
+  metadata: {
+    reviewMode: "consensus",
+    simple: false,
+    consensus: true,
+  },
+}, { statePath });
+assert.equal(plan.task.source, "plan");
+assert.equal(plan.task.metadata?.consensus, true);
+assert.equal(plan.run.metadata?.source, "plan");
+
+const chat = createTeamQueueTask({
+  teamId: "team_producers",
+  source: "chat",
+  title: "Chat request",
+  description: "Ask the team a question",
+  assignedMemberNames: ["Lead", "Reviewer"],
+}, { statePath });
+assert.equal(chat.task.source, "chat");
+assert.deepEqual(chat.run.route, ["Lead", "Reviewer"]);
+
+const producerTasks = listTeamQueueTasks("team_producers", { statePath });
+assert.equal(producerTasks.length, 3);
+assert.deepEqual(producerTasks.map((task) => task.source), ["board", "plan", "chat"]);
+assert.equal(getTeamQueueTask(board.task.id, { statePath })?.id, board.task.id);
+
+const producerRuns = listTeamQueueRuns("team_producers", { statePath });
+assert.equal(producerRuns.length, 3);
+assert.equal(getTeamQueueRun(chat.run.id, { statePath })?.id, chat.run.id);
+
+const reloaded = loadTeamQueueState({ statePath, recoverStaleActive: false });
+assert.ok(reloaded.tasks[board.task.id]);
+assert.ok(reloaded.tasks[plan.task.id]);
+assert.ok(reloaded.tasks[chat.task.id]);
+for (const run of [reloaded.runs[board.run.id], reloaded.runs[plan.run.id], reloaded.runs[chat.run.id]]) {
+  assert.equal(run.status, "queued");
+  assert.equal(run.startedAt, undefined);
+  assert.equal(run.turnIds.length, 0);
+}
+for (const task of [reloaded.tasks[board.task.id], reloaded.tasks[plan.task.id], reloaded.tasks[chat.task.id]]) {
+  assert.equal(task.startedAt, undefined);
+}
+for (const run of [reloaded.runs[board.run.id], reloaded.runs[plan.run.id], reloaded.runs[chat.run.id]]) {
+  assert.equal(run.turnIds.some((turnId) => {
+    const turn = reloaded.turns[turnId];
+    return Boolean(turn?.providerStartedAt || turn?.executionTimeoutStartedAt);
+  }), false);
+}
+
+const cancelled = cancelTeamQueueTask(board.task.id, { statePath });
+assert.equal(cancelled.task?.status, "cancelled");
+assert.equal(cancelled.runs[0]?.status, "cancelled");
+assert.ok(loadTeamQueueState({ statePath, recoverStaleActive: false }).tasks[board.task.id]);
+
+const producerStatus = getTeamQueueStatus("team_producers", { statePath });
+assert.equal(producerStatus.tasks.total, 3);
+assert.equal(producerStatus.tasks.bySource.board, 1);
+assert.equal(producerStatus.tasks.bySource.plan, 1);
+assert.equal(producerStatus.tasks.bySource.chat, 1);
+assert.equal(producerStatus.tasks.byStatus.cancelled, 1);
+assert.equal(producerStatus.tasks.byStatus.queued, 2);
+assert.equal(producerStatus.runs.byStatus.cancelled, 1);
+assert.equal(producerStatus.runs.byStatus.queued, 2);
+
+const finalGlobalStatus = getTeamQueueStatus(undefined, { statePath });
+assert.equal(finalGlobalStatus.tasks.bySource.board, 2);
+assert.equal(finalGlobalStatus.tasks.bySource.plan, 1);
+assert.equal(finalGlobalStatus.tasks.bySource.chat, 2);
+
+console.log(JSON.stringify({ ok: true, statePath, globalStatus: finalGlobalStatus, teamStatus, producerStatus }, null, 2));
