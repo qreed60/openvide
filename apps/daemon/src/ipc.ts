@@ -18,6 +18,7 @@ import * as sched from "./scheduleManager.js";
 import { detailOrchestratorRun, getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
 import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
 import { getTeamMetadata } from "./teamMetadata.js";
+import { getTeamQueueStatus } from "./teamQueueStore.js";
 import type { ProviderDetectionInfo } from "./agentProviders.js";
 
 const SOCKET_NAME = "daemon.sock";
@@ -750,6 +751,16 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
     case "team.metadata": {
       const tools = await detectInstalledTools();
       return { ok: true, teamMetadata: getTeamMetadata(tools) };
+    }
+
+    case "global.queue.status": {
+      return { ok: true, queueStatus: getTeamQueueStatus() };
+    }
+
+    case "team.queue.status": {
+      const teamId = req.teamId as string | undefined;
+      if (!teamId) return { ok: false, error: "Missing required: teamId" };
+      return { ok: true, queueStatus: getTeamQueueStatus(teamId) };
     }
 
     case "team.create": {

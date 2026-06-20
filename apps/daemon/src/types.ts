@@ -1,4 +1,5 @@
 import type { TeamMetadata } from "./teamMetadata.js";
+import type { TeamQueueStatusSummary } from "./teamQueueTypes.js";
 
 // ── Session & State ──
 
@@ -259,6 +260,7 @@ export interface IpcResponse {
   totalSessions?: number;
   tools?: Record<string, boolean>;
   teamMetadata?: TeamMetadata;
+  queueStatus?: TeamQueueStatusSummary;
   orchestrator?: { available: boolean; enabled: boolean; provider: string; runStore: boolean };
   orchestratorRuns?: unknown[];
   orchestratorRun?: unknown;
