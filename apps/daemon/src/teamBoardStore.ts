@@ -55,6 +55,10 @@ function boardMetadata(task: TeamQueueTask): BoardMetadata {
   return raw && typeof raw === "object" ? raw as BoardMetadata : {};
 }
 
+function isDeletedQueueTask(task: TeamQueueTask): boolean {
+  return Boolean(task.deletedAt) || task.visibility === "deleted";
+}
+
 function reviewStatusValue(value: unknown): TeamBoardReviewStatus {
   return typeof value === "string" && BOARD_REVIEW_STATUSES.has(value as TeamBoardReviewStatus)
     ? value as TeamBoardReviewStatus
@@ -160,6 +164,7 @@ export function listTeamBoardItems(teamId?: string, options?: TeamQueueStoreOpti
   const state = loadTeamQueueState(options);
   return Object.values(state.tasks)
     .filter((task) => task.source === "board")
+    .filter((task) => !isDeletedQueueTask(task))
     .filter((task) => !teamId || task.teamId === teamId)
     .map((task) => toBoardItem(task, state.runs))
     .filter((item): item is TeamBoardItem => Boolean(item))

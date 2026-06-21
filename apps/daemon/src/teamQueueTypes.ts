@@ -34,6 +34,8 @@ export type TeamQueueTurnStatus =
 
 export type TeamQueueResourceStatus = "available" | "reserved" | "running" | "disabled";
 
+export type TeamQueueVisibility = "visible" | "deleted";
+
 export type TeamBoardExecutionStatus =
   | "draft"
   | "queued"
@@ -58,6 +60,7 @@ export interface TeamQueueTask {
   teamId: string;
   source: TeamQueueTaskSource;
   status: TeamQueueTaskStatus;
+  visibility?: TeamQueueVisibility;
   title: string;
   description?: string;
   createdAt: string;
@@ -76,6 +79,9 @@ export interface TeamQueueTask {
   runIds: string[];
   priority?: number;
   metadata?: Record<string, unknown>;
+  deletedAt?: string;
+  deletedBy?: string;
+  deleteReason?: string;
 }
 
 export interface TeamQueueRun {
@@ -83,6 +89,7 @@ export interface TeamQueueRun {
   teamId: string;
   taskId: string;
   status: TeamQueueRunStatus;
+  visibility?: TeamQueueVisibility;
   route: string[];
   currentMember?: string;
   currentTurnId?: string;
@@ -96,6 +103,9 @@ export interface TeamQueueRun {
   turnIds: string[];
   error?: string;
   metadata?: Record<string, unknown>;
+  deletedAt?: string;
+  deletedBy?: string;
+  deleteReason?: string;
 }
 
 export interface TeamQueueTurn {
@@ -109,7 +119,9 @@ export interface TeamQueueTurn {
   model?: string;
   resourceKey: string;
   status: TeamQueueTurnStatus;
+  visibility?: TeamQueueVisibility;
   queuedAt: string;
+  updatedAt?: string;
   startedAt?: string;
   providerStartedAt?: string;
   finishedAt?: string;
@@ -117,6 +129,9 @@ export interface TeamQueueTurn {
   exitCode?: number;
   error?: string;
   metadata?: Record<string, unknown>;
+  deletedAt?: string;
+  deletedBy?: string;
+  deleteReason?: string;
 }
 
 export interface TeamQueueResource {
@@ -239,6 +254,11 @@ export interface TeamQueueStatusSummary {
   };
   activeRunIds: string[];
   activeTurnIds: string[];
+  deleted: {
+    tasks: number;
+    runs: number;
+    turns: number;
+  };
 }
 
 export interface CreateTeamQueueTaskInput {
@@ -251,6 +271,23 @@ export interface CreateTeamQueueTaskInput {
   createdBy?: string;
   sourceRef?: TeamQueueTask["sourceRef"];
   metadata?: Record<string, unknown>;
+}
+
+export interface DeleteTeamQueueItemInput {
+  teamId?: string;
+  queueTaskId?: string;
+  queueRunId?: string;
+  deletedBy?: string;
+  reason?: string;
+}
+
+export interface DeleteTeamQueueItemResult {
+  ok: boolean;
+  queueTaskId?: string;
+  queueRunIds: string[];
+  deletedAt?: string;
+  state: TeamQueueState;
+  error?: string;
 }
 
 export type TeamQueueDispatchEventType =

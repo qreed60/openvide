@@ -21,6 +21,7 @@ import { getTeamMetadata } from "./teamMetadata.js";
 import {
   cancelTeamQueueTask,
   createTeamQueueTask,
+  deleteTeamQueueItem,
   getTeamQueueRun,
   getTeamQueueStatus,
   getTeamQueueTask,
@@ -37,7 +38,7 @@ import {
 import { getResourceStatus, listResourceStatus, modelResourceKey } from "./modelResourceScheduler.js";
 import { dispatchTeamQueueOnce, getTeamQueueDispatchStatus } from "./teamQueueDispatcher.js";
 import type { ProviderDetectionInfo } from "./agentProviders.js";
-import type { TeamBoardReviewStatus, TeamQueueTaskSource } from "./teamQueueTypes.js";
+import type { TeamBoardReviewStatus, TeamQueueRun, TeamQueueTaskSource } from "./teamQueueTypes.js";
 
 const SOCKET_NAME = "daemon.sock";
 
@@ -149,6 +150,10 @@ function stringArrayValue(value: unknown): string[] | undefined {
 
 function numberValue(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function booleanValue(value: unknown): boolean {
+  return value === true || value === "true";
 }
 
 function taskSourceValue(value: unknown, fallback: TeamQueueTaskSource): TeamQueueTaskSource {
@@ -1083,7 +1088,7 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
     case "team.task.list": {
       const teamId = req.teamId as string | undefined;
       if (!teamId) return { ok: false, error: "Missing required: teamId" };
-      return { ok: true, teamTasks: tm.listTasks(teamId), queueTasks: listTeamQueueTasks(teamId) };
+      return { ok: true, teamTasks: tm.listTasks(teamId), queueTasks: listTeamQueueTasks(teamId, { includeDeleted: booleanValue(req.includeDeleted) }) };
     }
 
     case "team.task.get": {
@@ -1102,9 +1107,41 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       return { ok: true, queueTask: cancelled.task, queueRuns: cancelled.runs };
     }
 
+    case "team.queue.item.delete": {
+      const teamId = stringValue(req.teamId);
+      const queueTaskId = stringValue(req.queueTaskId) ?? stringValue(req.taskId);
+      const queueRunId = stringValue(req.queueRunId) ?? stringValue(req.runId);
+      try {
+        const deleted = deleteTeamQueueItem({
+          teamId,
+          queueTaskId,
+          queueRunId,
+          deletedBy: stringValue(req.deletedBy) ?? stringValue(req.by) ?? "user",
+          reason: stringValue(req.reason),
+        });
+        if (!deleted.ok) return { ok: false, error: deleted.error };
+        const queueTask = deleted.queueTaskId ? deleted.state.tasks[deleted.queueTaskId] : undefined;
+        const queueRuns = deleted.queueRunIds
+          .map((runId) => deleted.state.runs[runId])
+          .filter((run): run is TeamQueueRun => Boolean(run));
+        return {
+          ok: true,
+          queueTaskId: deleted.queueTaskId,
+          queueRunIds: deleted.queueRunIds,
+          queueTask,
+          queueTasks: queueTask ? [queueTask] : undefined,
+          queueRuns,
+          queueStatus: getTeamQueueStatus(teamId),
+          deletedAt: deleted.deletedAt,
+        };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
     case "team.run.list": {
       const teamId = stringValue(req.teamId);
-      return { ok: true, queueRuns: listTeamQueueRuns(teamId) };
+      return { ok: true, queueRuns: listTeamQueueRuns(teamId, { includeDeleted: booleanValue(req.includeDeleted) }) };
     }
 
     case "team.run.get": {

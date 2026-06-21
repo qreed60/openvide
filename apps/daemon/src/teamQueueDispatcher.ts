@@ -30,6 +30,10 @@ const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled", "int
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted", "skipped"]);
 
+function isDeletedRecord(record: { deletedAt?: string; visibility?: string }): boolean {
+  return Boolean(record.deletedAt) || record.visibility === "deleted";
+}
+
 class TeamQueueDispatchPause extends Error {
   constructor(
     message: string,
@@ -128,7 +132,7 @@ function setRunWaiting(
   ctx.events.push(event);
   updateTeamQueueState((state) => {
     const currentRun = state.runs[run.id];
-    if (currentRun && !TERMINAL_RUN_STATUSES.has(currentRun.status)) {
+    if (currentRun && !TERMINAL_RUN_STATUSES.has(currentRun.status) && !isDeletedRecord(currentRun)) {
       currentRun.status = status;
       currentRun.currentState = status;
       currentRun.currentMember = turn?.memberName ?? currentRun.currentMember;
@@ -142,7 +146,7 @@ function setRunWaiting(
     }
     if (turn) {
       const currentTurn = state.turns[turn.id];
-      if (currentTurn && !TERMINAL_TURN_STATUSES.has(currentTurn.status)) {
+      if (currentTurn && !TERMINAL_TURN_STATUSES.has(currentTurn.status) && !isDeletedRecord(currentTurn)) {
         currentTurn.status = status;
         currentTurn.providerStartedAt = undefined;
         currentTurn.executionTimeoutStartedAt = undefined;
@@ -161,6 +165,7 @@ function sortedDispatchableRuns(state: TeamQueueState): Array<{ task: TeamQueueT
     .map((run) => ({ run, task: state.tasks[run.taskId] }))
     .filter((item): item is { task: TeamQueueTask; run: TeamQueueRun } => Boolean(item.task))
     .filter(({ task, run }) => {
+      if (isDeletedRecord(task) || isDeletedRecord(run)) return false;
       if (TERMINAL_TASK_STATUSES.has(task.status)) return false;
       if (task.source === "board" && typeof task.metadata?.board === "object") {
         const board = task.metadata.board as { executionStatus?: unknown };
@@ -177,7 +182,7 @@ function sortedDispatchableRuns(state: TeamQueueState): Array<{ task: TeamQueueT
 
 function teamHasActiveRun(state: TeamQueueState, teamId: string, exceptRunId?: string): boolean {
   return Object.values(state.runs).some((run) => {
-    return run.teamId === teamId && run.id !== exceptRunId && run.status === "running";
+    return run.teamId === teamId && run.id !== exceptRunId && !isDeletedRecord(run) && run.status === "running";
   });
 }
 
@@ -198,7 +203,7 @@ function createOrReuseTurn(
   const resourceKey = modelResourceKey(member.tool, member.model);
   const state = updateTeamQueueState((draft) => {
     const currentRun = draft.runs[run.id];
-    if (!currentRun) return;
+    if (!currentRun || isDeletedRecord(currentRun)) return;
     const existing = existingOpenTurn(draft, currentRun, member);
     if (existing) {
       existing.resourceKey = resourceKey;
@@ -274,7 +279,7 @@ function markHandoff(
     const currentTask = state.tasks[task.id];
     const currentRun = state.runs[run.id];
     const timestamp = nowISO();
-    if (currentTask && currentTask.status !== "cancelled") {
+    if (currentTask && currentTask.status !== "cancelled" && !isDeletedRecord(currentTask)) {
       currentTask.status = "queued";
       currentTask.updatedAt = timestamp;
       currentTask.metadata = {
@@ -282,7 +287,7 @@ function markHandoff(
         dispatchBlockedReason: reason,
       };
     }
-    if (currentRun && !TERMINAL_RUN_STATUSES.has(currentRun.status)) {
+    if (currentRun && !TERMINAL_RUN_STATUSES.has(currentRun.status) && !isDeletedRecord(currentRun)) {
       currentRun.status = "queued";
       currentRun.currentState = "queued";
       currentRun.updatedAt = timestamp;
@@ -368,7 +373,8 @@ async function executeQueuedMemberTurn(
   const startedAt = nowISO();
   updateTeamQueueState((state) => {
     const currentTurn = state.turns[turn.id];
-    if (currentTurn) {
+    const shouldStartTurn = Boolean(currentTurn && !isDeletedRecord(currentTurn));
+    if (currentTurn && !isDeletedRecord(currentTurn)) {
       currentTurn.status = "running";
       currentTurn.startedAt = currentTurn.startedAt ?? startedAt;
       currentTurn.providerStartedAt = startedAt;
@@ -379,7 +385,7 @@ async function executeQueuedMemberTurn(
       };
     }
     const currentResource = state.resources[turn.resourceKey];
-    if (currentResource && currentResource.status !== "disabled") {
+    if (shouldStartTurn && currentResource && currentResource.status !== "disabled") {
       currentResource.status = "running";
       currentResource.activeTurnId = turn.id;
       currentResource.updatedAt = startedAt;
@@ -392,7 +398,7 @@ async function executeQueuedMemberTurn(
     const finishedAt = nowISO();
     updateTeamQueueState((state) => {
       const currentTurn = state.turns[turn.id];
-      if (!currentTurn) return;
+      if (!currentTurn || isDeletedRecord(currentTurn)) return;
       currentTurn.status = result.status === "idle" ? "completed" : "failed";
       currentTurn.finishedAt = finishedAt;
       currentTurn.error = result.status === "idle" ? undefined : result.errorText ?? result.responseText;
@@ -406,7 +412,7 @@ async function executeQueuedMemberTurn(
     const finishedAt = nowISO();
     updateTeamQueueState((state) => {
       const currentTurn = state.turns[turn.id];
-      if (!currentTurn) return;
+      if (!currentTurn || isDeletedRecord(currentTurn)) return;
       currentTurn.status = "failed";
       currentTurn.finishedAt = finishedAt;
       currentTurn.error = err instanceof Error ? err.message : String(err);
@@ -444,13 +450,13 @@ function markRunStarted(ctx: DispatchContext, task: TeamQueueTask, run: TeamQueu
   ctx.events.push(taskEvent, runEvent);
   updateTeamQueueState((state) => {
     const currentTask = state.tasks[task.id];
-    if (currentTask) {
+    if (currentTask && !isDeletedRecord(currentTask)) {
       currentTask.status = "running";
       currentTask.startedAt = currentTask.startedAt ?? timestamp;
       currentTask.updatedAt = timestamp;
     }
     const currentRun = state.runs[run.id];
-    if (currentRun) {
+    if (currentRun && !isDeletedRecord(currentRun)) {
       currentRun.status = "running";
       currentRun.currentState = "running";
       currentRun.startedAt = currentRun.startedAt ?? timestamp;
@@ -480,7 +486,7 @@ function markRunFinished(
   ctx.events.push(event);
   updateTeamQueueState((state) => {
     const currentRun = state.runs[run.id];
-    if (currentRun) {
+    if (currentRun && !isDeletedRecord(currentRun)) {
       currentRun.status = status;
       currentRun.currentState = status;
       currentRun.currentMember = undefined;
@@ -490,7 +496,7 @@ function markRunFinished(
       currentRun.error = status === "failed" ? summary : undefined;
     }
     const currentTask = state.tasks[run.taskId];
-    if (currentTask) {
+    if (currentTask && !isDeletedRecord(currentTask)) {
       currentTask.status = status;
       currentTask.finishedAt = timestamp;
       currentTask.updatedAt = timestamp;
