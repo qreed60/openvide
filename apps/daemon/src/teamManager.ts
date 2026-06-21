@@ -835,6 +835,16 @@ export type TeamMemberTurnInvoker = (
   prompt: string,
 ) => Promise<TeamMemberTurnCompletion>;
 
+export interface QueuedTeamChatResult {
+  userMessage?: TeamMessage;
+  assistant?: {
+    from: string;
+    to: string;
+    text: string;
+    orchestration?: TeamMessageOrchestration;
+  };
+}
+
 export function invokeTeamMemberTurn(member: TeamMember, prompt: string, cwd?: string): Promise<SessionCompletion> {
   if (activeWatchers.has(member.sessionId)) {
     return Promise.resolve({
@@ -996,7 +1006,7 @@ export async function runQueuedTeamChat(input: {
   text: string;
   invokeMember?: TeamMemberTurnInvoker;
   persistMessages?: boolean;
-}): Promise<TeamMessage | undefined> {
+}): Promise<QueuedTeamChatResult> {
   const team = getTeam(input.teamId);
   if (!team) throw new Error(`Team ${input.teamId} not found`);
   if (input.from !== "user" || input.to !== "*") {
@@ -1011,17 +1021,25 @@ export async function runQueuedTeamChat(input: {
       text: input.text,
     })
     : undefined;
+  let assistant: QueuedTeamChatResult["assistant"];
 
   await runTeamOrchestrator({
     team,
     userText: input.text,
     invokeMember: input.invokeMember ?? ((member, prompt) => invokeMemberTurn(member, prompt, team.workingDirectory)),
     writeFinalMessage: (fromName, finalText, orchestration) => {
+      const text = finalText.slice(0, 4000);
+      assistant = {
+        from: fromName,
+        to: "user",
+        text,
+        orchestration,
+      };
       if (!persistMessages) return;
       writeTeamMessage(input.teamId, {
         from: fromName,
         to: "user",
-        text: finalText.slice(0, 4000),
+        text,
         orchestration,
       });
     },
@@ -1029,7 +1047,7 @@ export async function runQueuedTeamChat(input: {
     summarizeBoard: (memberName) => summarizeBoardForChat(input.teamId, memberName),
   });
 
-  return msg;
+  return { userMessage: msg, assistant };
 }
 
 // ── Plans ──

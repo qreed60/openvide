@@ -92,10 +92,38 @@ async function smokeBasicDispatch(): Promise<void> {
   assert.deepEqual(result.dispatchedRunIds, [queued.run.id]);
   assert.equal(state.runs[queued.run.id]?.status, "completed");
   assert.equal(state.tasks[queued.task.id]?.status, "completed");
+  assert.equal(state.runs[queued.run.id]?.metadata?.assistantText, "queued chat completed");
+  assert.deepEqual(state.runs[queued.run.id]?.route, ["Lead"]);
+  assert.equal((state.runs[queued.run.id]?.metadata?.queuedChatResult as { memberName?: string } | undefined)?.memberName, "Lead");
   assert.ok(Object.values(state.turns).some((turn) => turn.runId === queued.run.id && turn.status === "completed"));
   assert.ok(result.events.some((event) => event.type === "task_dispatch_started"));
   assert.ok(result.events.some((event) => event.type === "model_resource_acquired"));
   assert.ok(result.events.some((event) => event.type === "model_resource_released"));
+}
+
+async function smokeNoOutputFailsWithDiagnostic(): Promise<void> {
+  resetQueue();
+  const team = makeTeam("team_no_output", "model-no-output");
+  installTeams(team);
+  const queued = queueChat(team.id, "No output queued chat");
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async () => ({
+      status: "idle",
+      responseText: "",
+    }),
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  assert.deepEqual(result.dispatchedRunIds, [queued.run.id]);
+  assert.ok(result.failedRunIds.includes(queued.run.id));
+  assert.equal(state.runs[queued.run.id]?.status, "failed");
+  assert.equal(state.tasks[queued.task.id]?.status, "failed");
+  assert.match(state.runs[queued.run.id]?.error ?? "", /Lead did not emit|without assistant output/);
+  assert.equal((state.runs[queued.run.id]?.metadata?.queuedChatResult as { finalStatus?: string } | undefined)?.finalStatus, "blocked");
+  assert.ok(state.runs[queued.run.id]?.metadata?.queuedChatResult);
 }
 
 async function smokeSameTeamWaits(): Promise<void> {
@@ -231,6 +259,7 @@ async function smokeReloadAndCancel(): Promise<void> {
 }
 
 await smokeBasicDispatch();
+await smokeNoOutputFailsWithDiagnostic();
 await smokeSameTeamWaits();
 await smokeSameResourceWaits();
 await smokeDifferentResourcesRunIndependently();

@@ -319,6 +319,85 @@ function summarizeDiagnostics(result: tm.TeamMemberTurnCompletion): string | und
   return result.diagnosticsSummary;
 }
 
+function trimResultText(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+function queuedChatFailureSummary(result: tm.QueuedTeamChatResult | undefined): string | undefined {
+  const status = result?.assistant?.orchestration?.status;
+  if (status === "failed") return trimResultText(result?.assistant?.text) ?? "Queued Team Chat failed without assistant output.";
+  if (status === "blocked") return trimResultText(result?.assistant?.text) ?? "Queued Team Chat blocked without assistant output.";
+  if (!trimResultText(result?.assistant?.text)) return "Queued Team Chat completed without assistant output.";
+  return undefined;
+}
+
+function persistQueuedChatResult(
+  ctx: DispatchContext,
+  task: TeamQueueTask,
+  run: TeamQueueRun,
+  result: tm.QueuedTeamChatResult | undefined,
+): string | undefined {
+  const assistant = result?.assistant;
+  const orchestration = assistant?.orchestration;
+  const assistantText = trimResultText(assistant?.text);
+  const route = orchestration?.route ?? [];
+  const finalStatus = orchestration?.status ?? (assistantText ? "completed" : "failed");
+  const latestTimelineEntry = orchestration?.timeline?.slice().reverse().find((entry) => entry.memberName || entry.tool || entry.model);
+  const diagnostic = queuedChatFailureSummary(result);
+
+  updateTeamQueueState((state) => {
+    const currentRun = state.runs[run.id];
+    const currentTask = state.tasks[task.id];
+    const timestamp = nowISO();
+    const resultMetadata = {
+      assistantText,
+      route,
+      routeSummary: orchestration?.routeSummary,
+      provider: latestTimelineEntry?.tool,
+      model: latestTimelineEntry?.model,
+      memberName: assistant?.from ?? latestTimelineEntry?.memberName,
+      finalStatus,
+      orchestrationRunId: orchestration?.runId,
+      diagnostics: diagnostic ?? latestTimelineEntry?.diagnostics,
+    };
+    if (currentRun && !isDeletedRecord(currentRun)) {
+      currentRun.route = route.length > 0 ? route : currentRun.route;
+      currentRun.metadata = {
+        ...(currentRun.metadata ?? {}),
+        queuedChatResult: resultMetadata,
+        assistantText,
+        route,
+        provider: resultMetadata.provider,
+        model: resultMetadata.model,
+        memberName: resultMetadata.memberName,
+        finalStatus,
+        orchestration,
+        noOutputDiagnostic: assistantText ? undefined : diagnostic,
+      };
+      currentRun.error = finalStatus === "failed" || !assistantText ? diagnostic : currentRun.error;
+      currentRun.updatedAt = timestamp;
+    }
+    if (currentTask && !isDeletedRecord(currentTask)) {
+      currentTask.metadata = {
+        ...(currentTask.metadata ?? {}),
+        queuedChatResult: resultMetadata,
+        assistantText,
+        route,
+        provider: resultMetadata.provider,
+        model: resultMetadata.model,
+        memberName: resultMetadata.memberName,
+        finalStatus,
+        orchestration,
+        noOutputDiagnostic: assistantText ? undefined : diagnostic,
+      };
+      currentTask.updatedAt = timestamp;
+    }
+  }, activeOptions(ctx.options));
+
+  return diagnostic;
+}
+
 async function defaultExecuteMember(input: QueuedMemberExecutorInput): Promise<tm.TeamMemberTurnCompletion> {
   return tm.invokeTeamMemberTurn(input.member, input.prompt, input.team.workingDirectory);
 }
@@ -507,11 +586,11 @@ async function executeChatRun(
   task: TeamQueueTask,
   run: TeamQueueRun,
   team: TeamConfig,
-): Promise<void> {
+): Promise<tm.QueuedTeamChatResult> {
   const from = typeof task.metadata?.from === "string" ? task.metadata.from : "user";
   const to = typeof task.metadata?.to === "string" ? task.metadata.to : "*";
   const text = task.description ?? task.title;
-  await tm.runQueuedTeamChat({
+  return tm.runQueuedTeamChat({
     teamId: run.teamId,
     from,
     to,
@@ -532,7 +611,13 @@ async function executeRun(
     if (task.source !== "chat") {
       throw new Error(`No executable dispatcher adapter for ${task.source}`);
     }
-    await executeChatRun(ctx, task, run, team);
+    const result = await executeChatRun(ctx, task, run, team);
+    const diagnostic = persistQueuedChatResult(ctx, task, run, result);
+    const finalStatus = result.assistant?.orchestration?.status;
+    if (diagnostic || finalStatus === "failed" || finalStatus === "blocked") {
+      markRunFinished(ctx, run, "failed", diagnostic ?? trimResultText(result.assistant?.text) ?? `Queued chat dispatch ended with status ${finalStatus}.`);
+      return "failed";
+    }
     markRunFinished(ctx, run, "completed", "Queued chat dispatch completed.");
     return "completed";
   } catch (err) {
