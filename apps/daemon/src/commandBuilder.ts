@@ -28,8 +28,6 @@ function buildClaudeCommand(opts: BuildCommandOpts): string {
 }
 
 function buildCodexCommand(opts: BuildCommandOpts): string {
-  const envPrefix = opts.model ? `OPENAI_MODEL=${escapeShellArg(opts.model)} ` : "";
-
   let prompt = opts.prompt;
   if (opts.mode === "plan") {
     prompt = "You are in PLAN mode. Analyze the codebase and describe what changes you would make, but do NOT apply any changes.\n\n" + prompt;
@@ -39,19 +37,21 @@ function buildCodexCommand(opts: BuildCommandOpts): string {
     // Place exec flags before the resume subcommand for compatibility.
     const parts = [
       "codex", "exec",
-      "--json", "--full-auto", "--skip-git-repo-check",
+      ...(opts.model ? ["--model", escapeShellArg(opts.model)] : []),
+      "--json", "--sandbox", "workspace-write", "--skip-git-repo-check",
       "resume", escapeShellArg(opts.conversationId),
       "--", escapeShellArg(prompt),
     ];
-    return envPrefix + parts.join(" ");
+    return parts.join(" ");
   }
 
   const parts = [
     "codex", "exec",
-    "--json", "--full-auto", "--skip-git-repo-check",
+    ...(opts.model ? ["--model", escapeShellArg(opts.model)] : []),
+    "--json", "--sandbox", "workspace-write", "--skip-git-repo-check",
     "--", escapeShellArg(prompt),
   ];
-  return envPrefix + parts.join(" ");
+  return parts.join(" ");
 }
 
 function buildGeminiCommand(opts: BuildCommandOpts): string {

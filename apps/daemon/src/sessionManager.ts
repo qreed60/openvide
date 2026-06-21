@@ -501,7 +501,15 @@ export function sendTurn(id: string, prompt: string, turnOpts?: { mode?: string;
     );
   };
 
-  const proc = startRunner(session.executionBackend ?? "cli");
+  // Codex app-server currently does not reliably honor per-session model overrides.
+  // Use the CLI backend when an explicit model is set so team members can route to
+  // distinct local LM Studio model aliases.
+  const preferredBackend =
+    session.tool === "codex" && effectiveModel
+      ? "cli"
+      : session.executionBackend ?? "cli";
+
+  const proc = startRunner(preferredBackend);
 
   runningProcesses.set(id, proc);
   session.pid = proc.pid ?? proc.child?.pid;

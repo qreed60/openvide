@@ -15,6 +15,30 @@ import { detectTailscaleIp, detectTailscaleHostname, getTailscaleTls } from "./c
 import { encodeQR } from "./qrText.js";
 import * as tm from "./teamManager.js";
 import * as sched from "./scheduleManager.js";
+import { detailOrchestratorRun, getOrchestratorRun, listRecentOrchestratorRuns } from "./orchestratorRunStore.js";
+import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
+import { getTeamMetadata } from "./teamMetadata.js";
+import {
+  cancelTeamQueueTask,
+  createTeamQueueTask,
+  deleteTeamQueueItem,
+  getTeamQueueRun,
+  getTeamQueueStatus,
+  getTeamQueueTask,
+  listTeamQueueRuns,
+  listTeamQueueTasks,
+} from "./teamQueueStore.js";
+import {
+  cancelTeamBoardItem,
+  createTeamBoardItem,
+  getTeamBoardItem,
+  listTeamBoardItems,
+  setTeamBoardReviewStatus,
+} from "./teamBoardStore.js";
+import { getResourceStatus, listResourceStatus, modelResourceKey } from "./modelResourceScheduler.js";
+import { dispatchTeamQueueOnce, getTeamQueueDispatchStatus } from "./teamQueueDispatcher.js";
+import type { ProviderDetectionInfo } from "./agentProviders.js";
+import type { TeamBoardReviewStatus, TeamQueueRun, TeamQueueTaskSource } from "./teamQueueTypes.js";
 
 const SOCKET_NAME = "daemon.sock";
 
@@ -114,25 +138,182 @@ function snapshotBridgeConfig(config: BridgeConfig): BridgeConfigSnapshot {
   };
 }
 
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function stringArrayValue(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const parsed = value.map((item) => stringValue(item)).filter((item): item is string => Boolean(item));
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+function numberValue(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function booleanValue(value: unknown): boolean {
+  return value === true || value === "true";
+}
+
+function taskSourceValue(value: unknown, fallback: TeamQueueTaskSource): TeamQueueTaskSource {
+  const source = stringValue(value);
+  if (source === "board" || source === "plan" || source === "chat" || source === "scheduler" || source === "manual") {
+    return source;
+  }
+  return fallback;
+}
+
+function boardReviewStatusValue(value: unknown): TeamBoardReviewStatus | undefined {
+  const status = stringValue(value);
+  if (
+    status === "not_required"
+    || status === "pending_review"
+    || status === "approved"
+    || status === "revise"
+    || status === "rejected"
+  ) {
+    return status;
+  }
+  return undefined;
+}
+
+function queueAssignedMembers(req: IpcRequest): string[] | undefined {
+  return stringArrayValue(req.assignedMemberNames)
+    ?? stringArrayValue(req.assignedMembers)
+    ?? stringArrayValue(req.members)
+    ?? (stringValue(req.owner) ? [stringValue(req.owner)!] : undefined)
+    ?? (stringValue(req.to) && stringValue(req.to) !== "*" ? [stringValue(req.to)!] : undefined);
+}
+
+function planQueueMetadata(req: IpcRequest): Record<string, unknown> {
+  const mode = stringValue(req.mode);
+  const reviewMode = stringValue(req.reviewMode) ?? mode;
+  return {
+    reviewMode,
+    mode,
+    simple: reviewMode === "simple",
+    consensus: reviewMode === "consensus",
+    reviewers: stringArrayValue(req.reviewers),
+    maxIterations: typeof req.maxIterations === "number" ? req.maxIterations : undefined,
+  };
+}
+
+function chatQueueMetadata(req: IpcRequest): Record<string, unknown> {
+  return {
+    from: stringValue(req.from) ?? "user",
+    to: stringValue(req.to) ?? "*",
+  };
+}
+
+const DETECTABLE_TOOLS = ["claude", "codex", "gemini", "opencode", "openhands"];
+const OPENHANDS_COMMAND_ENV = "OPENVIDE_OPENHANDS_COMMAND";
+
+function firstLines(text: string, maxLines: number, maxChars: number): string | undefined {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, maxLines);
+  const summary = lines.join("\n").slice(0, maxChars).trim();
+  return summary || undefined;
+}
+
+async function execFileBounded(
+  command: string,
+  args: string[],
+  timeout = 2000,
+): Promise<{ ok: boolean; stdout: string; stderr: string; error?: string }> {
+  return new Promise((resolve) => {
+    child_process.execFile(command, args, { timeout, maxBuffer: 8192 }, (err, stdout, stderr) => {
+      resolve({
+        ok: !err,
+        stdout: stdout.toString(),
+        stderr: stderr.toString(),
+        error: err ? (err instanceof Error ? err.message : String(err)) : undefined,
+      });
+    });
+  });
+}
+
+async function detectCommand(tool: string): Promise<string | undefined> {
+  if (!/^[a-z][a-z0-9_-]*$/i.test(tool)) return undefined;
+  const result = await execFileBounded("sh", ["-lc", `command -v ${tool}`], 1500);
+  return result.ok ? firstLines(result.stdout, 1, 500) : undefined;
+}
+
+async function detectOpenCode(command: string): Promise<ProviderDetectionInfo> {
+  const detection: ProviderDetectionInfo = { available: true, command };
+  const version = await execFileBounded(command, ["--version"], 1500);
+  detection.version = firstLines(`${version.stdout}\n${version.stderr}`, 1, 200);
+
+  const help = await execFileBounded(command, ["--help"], 1500);
+  detection.helpSummary = firstLines(`${help.stdout}\n${help.stderr}`, 8, 1000);
+  if (!version.ok && !help.ok && !detection.version && !detection.helpSummary) {
+    detection.error = help.error ?? version.error;
+  }
+  return detection;
+}
+
+function openHandsVersionSummary(text: string): string | undefined {
+  const versions = text
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .map((line) => line.replace(/^\|\s*/, "").replace(/\s*\|$/, "").trim())
+    .filter((line) => /^OpenHands (SDK|CLI)\b/.test(line));
+  return firstLines(versions.join("\n"), 2, 200);
+}
+
+async function detectOpenHands(command: string): Promise<ProviderDetectionInfo> {
+  const detection: ProviderDetectionInfo = { available: true, command };
+  const version = await execFileBounded(command, ["--version"], 7000);
+  const versionText = `${version.stdout}\n${version.stderr}`;
+  detection.version = openHandsVersionSummary(versionText) ?? firstLines(versionText, 2, 200);
+
+  const help = await execFileBounded(command, ["--help"], 7000);
+  detection.helpSummary = firstLines(help.stdout, 12, 1200) ?? firstLines(help.stderr, 12, 1200);
+  if (!version.ok && !help.ok && !detection.version && !detection.helpSummary) {
+    detection.error = help.error ?? version.error;
+  }
+  return detection;
+}
+
 /** Check which CLI tools are installed on this host. */
-async function detectInstalledTools(): Promise<Record<string, boolean>> {
-  const tools = ["claude", "codex", "gemini"];
-  const results: Record<string, boolean> = {};
+async function detectInstalledTools(): Promise<Record<string, ProviderDetectionInfo>> {
+  const results: Record<string, ProviderDetectionInfo> = {};
   await Promise.all(
-    tools.map(async (tool) => {
+    DETECTABLE_TOOLS.map(async (tool) => {
       try {
-        await new Promise<void>((resolve, reject) => {
-          child_process.exec(`command -v ${tool}`, { timeout: 3000 }, (err) => {
-            err ? reject(err) : resolve();
-          });
-        });
-        results[tool] = true;
+        const command = await detectCommand(tool);
+        if (!command) {
+          const override = tool === "openhands" ? process.env[OPENHANDS_COMMAND_ENV]?.trim() : undefined;
+          if (override) {
+            results[tool] = await detectOpenHands(override);
+            return;
+          }
+          results[tool] = { available: false };
+          return;
+        }
+        if (tool === "opencode") {
+          results[tool] = await detectOpenCode(command);
+          return;
+        }
+        if (tool === "openhands") {
+          results[tool] = await detectOpenHands(command);
+          return;
+        }
+        results[tool] = { available: true, command };
       } catch {
-        results[tool] = false;
+        results[tool] = { available: false };
       }
     }),
   );
   return results;
+}
+
+function toolAvailabilityMap(tools: Record<string, ProviderDetectionInfo>): Record<string, boolean> {
+  return Object.fromEntries(Object.entries(tools).map(([tool, detection]) => [tool, detection.available === true]));
 }
 
 export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
@@ -146,7 +327,8 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
         name: os.hostname(),
         activeSessions: sm.getActiveCount(),
         totalSessions: sessions.length,
-        tools,
+        tools: toolAvailabilityMap(tools),
+        orchestrator: getTeamOrchestratorStatus(),
       };
     }
 
@@ -327,6 +509,21 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       }
       const models = await listCodexModels();
       return { ok: true, models };
+    }
+
+    case "model.resources.status": {
+      const resourceKey = req.resourceKey as string | undefined;
+      const provider = req.provider as string | undefined;
+      const model = req.model as string | undefined;
+      try {
+        if (resourceKey || provider) {
+          const key = resourceKey ?? modelResourceKey(provider as string, model);
+          return { ok: true, resourceStatus: getResourceStatus(key) };
+        }
+        return { ok: true, resourceStatus: listResourceStatus() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
     }
 
     case "config.setPushToken": {
@@ -653,6 +850,37 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
 
     // ── Team commands ──
 
+    case "team.metadata": {
+      const tools = await detectInstalledTools();
+      return { ok: true, teamMetadata: getTeamMetadata(tools) };
+    }
+
+    case "global.queue.status": {
+      return { ok: true, queueStatus: getTeamQueueStatus() };
+    }
+
+    case "team.queue.status": {
+      const teamId = req.teamId as string | undefined;
+      if (!teamId) return { ok: false, error: "Missing required: teamId" };
+      return { ok: true, queueStatus: getTeamQueueStatus(teamId) };
+    }
+
+    case "team.queue.dispatch_once": {
+      try {
+        return { ok: true, queueDispatch: await dispatchTeamQueueOnce() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    case "team.queue.dispatch_status": {
+      try {
+        return { ok: true, queueDispatch: getTeamQueueDispatchStatus() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
     case "team.create": {
       const name = req.name as string | undefined;
       const cwd = req.cwd as string | undefined;
@@ -661,7 +889,7 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
         return { ok: false, error: "Missing required: name, cwd, members" };
       }
       try {
-        const team = tm.createTeam(name, cwd, members as any[]);
+        const team = tm.createTeam(name, cwd, members, req.routingPolicy as import("./types.js").TeamRoutingPolicy | undefined);
         return { ok: true, team };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -718,7 +946,8 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       const team = tm.updateTeam(teamId, {
         name: req.name as string | undefined,
         workingDirectory: req.cwd as string | undefined,
-        members: req.members as Array<{ name: string; tool: Tool; model?: string; role: string }> | undefined,
+        members: req.members as Array<{ name: string; tool: string; model?: string; role: string }> | undefined,
+        routingPolicy: req.routingPolicy as import("./types.js").TeamRoutingPolicy | undefined,
       });
       if (!team) return { ok: false, error: `Team ${teamId} not found` };
       return { ok: true, team };
@@ -732,17 +961,110 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       return { ok: true };
     }
 
+    case "team.board.items.list": {
+      const teamId = stringValue(req.teamId);
+      if (!teamId) return { ok: false, error: "Missing required: teamId" };
+      return { ok: true, boardItems: listTeamBoardItems(teamId) };
+    }
+
+    case "team.board.item.get": {
+      const itemId = stringValue(req.itemId) ?? stringValue(req.boardItemId) ?? stringValue(req.id);
+      if (!itemId) return { ok: false, error: "Missing required: itemId" };
+      const boardItem = getTeamBoardItem(itemId);
+      if (!boardItem) return { ok: false, error: `Board item ${itemId} not found` };
+      return { ok: true, boardItem };
+    }
+
+    case "team.board.item.create": {
+      const teamId = stringValue(req.teamId);
+      const title = stringValue(req.title) ?? stringValue(req.subject);
+      if (!teamId || !title) return { ok: false, error: "Missing required: teamId, title" };
+      try {
+        const created = createTeamBoardItem({
+          teamId,
+          title,
+          description: stringValue(req.description) ?? stringValue(req.prompt),
+          assignedMembers: stringArrayValue(req.assignedMembers) ?? stringArrayValue(req.assignedMemberNames) ?? queueAssignedMembers(req),
+          reviewerMembers: stringArrayValue(req.reviewerMembers) ?? stringArrayValue(req.reviewers),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.createdBy) ?? stringValue(req.from) ?? "user",
+          executionStatus: stringValue(req.executionStatus) === "draft" || stringValue(req.executionStatus) === "blocked"
+            ? stringValue(req.executionStatus) as "draft" | "blocked"
+            : "queued",
+          reviewStatus: boardReviewStatusValue(req.reviewStatus),
+          reviewFeedback: stringValue(req.reviewFeedback),
+          blockedReason: stringValue(req.blockedReason),
+        });
+        return {
+          ok: true,
+          boardItem: created.boardItem,
+          queueTask: created.queueTask,
+          queueRuns: created.queueRuns,
+          queueRun: created.queueRuns[0],
+        };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    case "team.board.item.cancel": {
+      const itemId = stringValue(req.itemId) ?? stringValue(req.boardItemId) ?? stringValue(req.id) ?? stringValue(req.taskId);
+      if (!itemId) return { ok: false, error: "Missing required: itemId" };
+      const cancelled = cancelTeamBoardItem(itemId);
+      if (!cancelled.boardItem) return { ok: false, error: `Board item ${itemId} not found` };
+      return { ok: true, boardItem: cancelled.boardItem, queueTask: cancelled.queueTask, queueRuns: cancelled.queueRuns };
+    }
+
+    case "team.board.item.set_review_status": {
+      const itemId = stringValue(req.itemId) ?? stringValue(req.boardItemId) ?? stringValue(req.id);
+      const reviewStatus = boardReviewStatusValue(req.reviewStatus);
+      if (!itemId || !reviewStatus) return { ok: false, error: "Missing required: itemId, reviewStatus" };
+      const boardItem = setTeamBoardReviewStatus({
+        itemId,
+        reviewStatus,
+        reviewFeedback: stringValue(req.reviewFeedback),
+      });
+      if (!boardItem) return { ok: false, error: `Board item ${itemId} not found` };
+      return { ok: true, boardItem };
+    }
+
     case "team.task.create": {
       const teamId = req.teamId as string | undefined;
-      const subject = req.subject as string | undefined;
-      const description = req.description as string ?? "";
+      const subject = stringValue(req.subject) ?? stringValue(req.title);
+      const description = stringValue(req.description) ?? stringValue(req.prompt) ?? "";
       const owner = req.owner as string | undefined;
       if (!teamId || !subject) {
         return { ok: false, error: "Missing required: teamId, subject" };
       }
       try {
-        const task = tm.createTask(teamId, subject, description, owner ?? "", req.dependencies as string[] | undefined);
-        return { ok: true, teamTask: task };
+        const source = taskSourceValue(req.source, "board");
+        let task: import("./types.js").TeamTask | undefined;
+        if (source === "board" || source === "manual") {
+          task = tm.createTask(teamId, subject, description, owner ?? "", req.dependencies as string[] | undefined, {
+            autoStart: false,
+          });
+        }
+        const queueCreated = createTeamQueueTask({
+          teamId,
+          source,
+          title: subject,
+          description,
+          assignedMemberNames: queueAssignedMembers(req),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.createdBy) ?? stringValue(req.from) ?? "user",
+          sourceRef: {
+            boardTaskId: stringValue(req.boardTaskId) ?? task?.id,
+            messageId: stringValue(req.messageId),
+            scheduleId: stringValue(req.scheduleId),
+          },
+          metadata: {
+            producerCommand: "team.task.create",
+            legacyOwner: stringValue(owner),
+            ...(source === "plan" ? planQueueMetadata(req) : {}),
+            ...(source === "chat" ? chatQueueMetadata(req) : {}),
+          },
+        });
+        return { ok: true, teamTask: task, queueTask: queueCreated.task, queueRun: queueCreated.run };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
@@ -766,7 +1088,68 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
     case "team.task.list": {
       const teamId = req.teamId as string | undefined;
       if (!teamId) return { ok: false, error: "Missing required: teamId" };
-      return { ok: true, teamTasks: tm.listTasks(teamId) };
+      return { ok: true, teamTasks: tm.listTasks(teamId), queueTasks: listTeamQueueTasks(teamId, { includeDeleted: booleanValue(req.includeDeleted) }) };
+    }
+
+    case "team.task.get": {
+      const taskId = stringValue(req.taskId) ?? stringValue(req.id);
+      if (!taskId) return { ok: false, error: "Missing required: taskId" };
+      const task = getTeamQueueTask(taskId);
+      if (!task) return { ok: false, error: `Queue task ${taskId} not found` };
+      return { ok: true, queueTask: task };
+    }
+
+    case "team.task.cancel": {
+      const taskId = stringValue(req.taskId) ?? stringValue(req.id);
+      if (!taskId) return { ok: false, error: "Missing required: taskId" };
+      const cancelled = cancelTeamQueueTask(taskId);
+      if (!cancelled.task) return { ok: false, error: `Queue task ${taskId} not found` };
+      return { ok: true, queueTask: cancelled.task, queueRuns: cancelled.runs };
+    }
+
+    case "team.queue.item.delete": {
+      const teamId = stringValue(req.teamId);
+      const queueTaskId = stringValue(req.queueTaskId) ?? stringValue(req.taskId);
+      const queueRunId = stringValue(req.queueRunId) ?? stringValue(req.runId);
+      try {
+        const deleted = deleteTeamQueueItem({
+          teamId,
+          queueTaskId,
+          queueRunId,
+          deletedBy: stringValue(req.deletedBy) ?? stringValue(req.by) ?? "user",
+          reason: stringValue(req.reason),
+        });
+        if (!deleted.ok) return { ok: false, error: deleted.error };
+        const queueTask = deleted.queueTaskId ? deleted.state.tasks[deleted.queueTaskId] : undefined;
+        const queueRuns = deleted.queueRunIds
+          .map((runId) => deleted.state.runs[runId])
+          .filter((run): run is TeamQueueRun => Boolean(run));
+        return {
+          ok: true,
+          queueTaskId: deleted.queueTaskId,
+          queueRunIds: deleted.queueRunIds,
+          queueTask,
+          queueTasks: queueTask ? [queueTask] : undefined,
+          queueRuns,
+          queueStatus: getTeamQueueStatus(teamId),
+          deletedAt: deleted.deletedAt,
+        };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    case "team.run.list": {
+      const teamId = stringValue(req.teamId);
+      return { ok: true, queueRuns: listTeamQueueRuns(teamId, { includeDeleted: booleanValue(req.includeDeleted) }) };
+    }
+
+    case "team.run.get": {
+      const runId = stringValue(req.runId) ?? stringValue(req.id);
+      if (!runId) return { ok: false, error: "Missing required: runId" };
+      const run = getTeamQueueRun(runId);
+      if (!run) return { ok: false, error: `Queue run ${runId} not found` };
+      return { ok: true, queueRun: run };
     }
 
     case "team.task.comment": {
@@ -803,6 +1186,80 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       if (!teamId) return { ok: false, error: "Missing required: teamId" };
       const limit = typeof req.limit === "number" ? req.limit : undefined;
       return { ok: true, teamMessages: tm.listMessages(teamId, limit) };
+    }
+
+    case "team.chat.queue": {
+      const teamId = stringValue(req.teamId);
+      const text = stringValue(req.text) ?? stringValue(req.prompt) ?? stringValue(req.message);
+      if (!teamId || !text) {
+        return { ok: false, error: "Missing required: teamId, text" };
+      }
+      try {
+        const title = stringValue(req.title) ?? `Team chat: ${text.slice(0, 80)}`;
+        const queued = createTeamQueueTask({
+          teamId,
+          source: "chat",
+          title,
+          description: text,
+          assignedMemberNames: queueAssignedMembers(req),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.from) ?? stringValue(req.createdBy) ?? "user",
+          sourceRef: {
+            messageId: stringValue(req.messageId),
+          },
+          metadata: {
+            producerCommand: "team.chat.queue",
+            ...chatQueueMetadata(req),
+          },
+        });
+        return { ok: true, queueTask: queued.task, queueRun: queued.run };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    case "team.orchestrator.runs.list": {
+      const limit = typeof req.limit === "number" ? req.limit : undefined;
+      const teamId = typeof req.teamId === "string" ? req.teamId : undefined;
+      return { ok: true, orchestratorRuns: listRecentOrchestratorRuns(limit, teamId) };
+    }
+
+    case "team.orchestrator.run.get": {
+      const runId = req.runId as string | undefined;
+      if (!runId) return { ok: false, error: "Missing required: runId" };
+      const run = getOrchestratorRun(runId);
+      if (!run) return { ok: false, error: `Orchestrator run ${runId} not found` };
+      return { ok: true, orchestratorRun: detailOrchestratorRun(run) };
+    }
+
+    case "team.plan.create": {
+      const teamId = stringValue(req.teamId);
+      const request = stringValue(req.request) ?? stringValue(req.prompt) ?? stringValue(req.description);
+      if (!teamId || !request) {
+        return { ok: false, error: "Missing required: teamId, request" };
+      }
+      try {
+        const queued = createTeamQueueTask({
+          teamId,
+          source: "plan",
+          title: stringValue(req.title) ?? `Plan request: ${request.slice(0, 80)}`,
+          description: request,
+          assignedMemberNames: queueAssignedMembers(req),
+          priority: numberValue(req.priority, 50),
+          createdBy: stringValue(req.createdBy) ?? "user",
+          sourceRef: {
+            planId: stringValue(req.planId),
+            planRevisionId: stringValue(req.planRevisionId),
+          },
+          metadata: {
+            producerCommand: "team.plan.create",
+            ...planQueueMetadata(req),
+          },
+        });
+        return { ok: true, queueTask: queued.task, queueRun: queued.run };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
     }
 
     case "team.plan.submit": {

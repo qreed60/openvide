@@ -13,10 +13,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { daemonDir, newId, nowISO, log, logError } from "./utils.js";
 import * as sm from "./sessionManager.js";
+import { runTeamOrchestrator } from "./teamOrchestrator.js";
+import { executeProviderTurn } from "./agentProviders.js";
+import type { ProviderExecutionResult } from "./agentProviders.js";
+import { isExecutableTeamTool } from "./teamMetadata.js";
+import { getCoordinatorMember, normalizeTeamRole, roleMatches } from "./teamRoles.js";
 import type {
   TeamConfig, TeamMember, TeamTask, TaskStatus, TaskComment,
-  TeamMessage, TeamPlan, PlanRevision, PlanReviewVote, PlanMode,
-  Tool, IpcResponse,
+  TeamMessage, TeamMessageOrchestration, TeamPlan, PlanRevision, PlanReviewVote, PlanMode,
+  Tool, TeamTool, IpcResponse, TeamRoutingPolicy,
 } from "./types.js";
 
 const TEAMS_DIR = path.join(daemonDir(), "teams");
@@ -65,20 +70,62 @@ function readJsonl<T>(filePath: string, limit?: number): T[] {
   } catch { return []; }
 }
 
+function normalizeRoutingPolicy(policy: TeamRoutingPolicy | undefined): TeamRoutingPolicy | undefined {
+  if (!policy) return undefined;
+  const next: TeamRoutingPolicy = {};
+  if (typeof policy.maxCycles === "number" && Number.isFinite(policy.maxCycles)) next.maxCycles = Math.max(1, Math.floor(policy.maxCycles));
+  if (typeof policy.maxTasksPerCycle === "number" && Number.isFinite(policy.maxTasksPerCycle)) next.maxTasksPerCycle = Math.max(1, Math.floor(policy.maxTasksPerCycle));
+  if (typeof policy.maxParallelTasks === "number" && Number.isFinite(policy.maxParallelTasks)) next.maxParallelTasks = Math.max(1, Math.floor(policy.maxParallelTasks));
+  if (typeof policy.requireReviewForWrites === "boolean") next.requireReviewForWrites = policy.requireReviewForWrites;
+  if (typeof policy.defaultReadOnly === "boolean") next.defaultReadOnly = policy.defaultReadOnly;
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function executableToolOrThrow(tool: string): TeamTool {
+  if (isExecutableTeamTool(tool)) return tool;
+  throw new Error(`Team provider ${tool || "(missing)"} is not enabled for execution`);
+}
+
+function isSessionBackedTool(tool: TeamTool): tool is Tool {
+  return tool === "claude" || tool === "codex" || tool === "gemini";
+}
+
+function directProviderSessionId(teamId: string, memberName: string, tool: TeamTool): string {
+  const safeName = memberName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "member";
+  return `${tool}:${teamId}:${safeName}`;
+}
+
+function removeMemberSession(member: TeamMember): void {
+  if (isSessionBackedTool(member.tool)) {
+    sm.removeSession(member.sessionId);
+  }
+}
+
 // ── Team CRUD ──
 
 export function createTeam(
   name: string,
   workingDirectory: string,
-  members: Array<{ name: string; tool: Tool; model?: string; role: string }>,
+  members: Array<{ name: string; tool: string; model?: string; role: string }>,
+  routingPolicy?: TeamRoutingPolicy,
 ): TeamConfig {
   const teamId = newId("team");
   const now = nowISO();
 
   // Create a daemon session for each member
   const resolvedMembers: TeamMember[] = members.map((m) => {
+    const tool = executableToolOrThrow(m.tool);
+    if (!isSessionBackedTool(tool)) {
+      return {
+        name: m.name,
+        tool,
+        model: m.model,
+        role: normalizeTeamRole(m.role),
+        sessionId: directProviderSessionId(teamId, m.name, tool),
+      };
+    }
     const session = sm.createSession(
-      m.tool,
+      tool,
       workingDirectory,
       m.model,
       undefined,
@@ -87,9 +134,9 @@ export function createTeam(
     );
     return {
       name: m.name,
-      tool: m.tool,
+      tool,
       model: m.model,
-      role: m.role as TeamMember["role"],
+      role: normalizeTeamRole(m.role),
       sessionId: session.id,
     };
   });
@@ -99,6 +146,7 @@ export function createTeam(
     name,
     workingDirectory,
     members: resolvedMembers,
+    routingPolicy: normalizeRoutingPolicy(routingPolicy),
     createdAt: now,
     updatedAt: now,
   };
@@ -122,7 +170,8 @@ export function updateTeam(
   updates: {
     name?: string;
     workingDirectory?: string;
-    members?: Array<{ name: string; tool: Tool; model?: string; role: string }>;
+    members?: Array<{ name: string; tool: string; model?: string; role: string }>;
+    routingPolicy?: TeamRoutingPolicy;
   },
 ): TeamConfig | null {
   const state = sm.getState();
@@ -136,7 +185,7 @@ export function updateTeam(
       name: member.name.trim(),
       tool: member.tool,
       model: member.model,
-      role: member.role,
+      role: normalizeTeamRole(member.role),
     }))
     .filter((member) => member.name.length > 0);
 
@@ -145,23 +194,35 @@ export function updateTeam(
   const resolvedMembers: TeamMember[] = nextMembersInput.map((member) => {
     const existing = currentByName.get(member.name);
     if (existing && existing.tool === member.tool && existing.model === member.model) {
-      sm.updateSession(existing.sessionId, {
-        workingDirectory: nextWorkingDirectory,
-        model: member.model,
-        runKind: "team",
-        teamId,
-        teamName: nextName,
-      });
+      if (isSessionBackedTool(existing.tool)) {
+        sm.updateSession(existing.sessionId, {
+          workingDirectory: nextWorkingDirectory,
+          model: member.model,
+          runKind: "team",
+          teamId,
+          teamName: nextName,
+        });
+      }
       reusedSessionIds.add(existing.sessionId);
       return {
         ...existing,
-        role: member.role as TeamMember["role"],
+        role: normalizeTeamRole(member.role),
         model: member.model,
       };
     }
 
+    const tool = executableToolOrThrow(member.tool);
+    if (!isSessionBackedTool(tool)) {
+      return {
+        name: member.name,
+        tool,
+        model: member.model,
+        role: normalizeTeamRole(member.role),
+        sessionId: directProviderSessionId(teamId, member.name, tool),
+      };
+    }
     const session = sm.createSession(
-      member.tool,
+      tool,
       nextWorkingDirectory,
       member.model,
       undefined,
@@ -170,16 +231,16 @@ export function updateTeam(
     );
     return {
       name: member.name,
-      tool: member.tool,
+      tool,
       model: member.model,
-      role: member.role as TeamMember["role"],
+      role: normalizeTeamRole(member.role),
       sessionId: session.id,
     };
   });
 
   for (const member of current.members) {
     if (!reusedSessionIds.has(member.sessionId)) {
-      sm.removeSession(member.sessionId);
+      removeMemberSession(member);
     }
   }
 
@@ -188,6 +249,7 @@ export function updateTeam(
     name: nextName,
     workingDirectory: nextWorkingDirectory,
     members: resolvedMembers,
+    routingPolicy: updates.routingPolicy === undefined ? current.routingPolicy : normalizeRoutingPolicy(updates.routingPolicy),
     updatedAt: nowISO(),
   };
 
@@ -216,7 +278,7 @@ export function deleteTeam(teamId: string): boolean {
 
   // Remove member sessions
   for (const member of team.members) {
-    sm.removeSession(member.sessionId);
+    removeMemberSession(member);
   }
 
   // Remove team directory
@@ -333,7 +395,7 @@ function handleTaskStatusChange(teamId: string, task: TeamTask, newStatus: TaskS
 
   if (newStatus === "done" || newStatus === "review") {
     // Auto-send to reviewer
-    const reviewer = team.members.find((m) => m.role === "reviewer");
+    const reviewer = team.members.find((m) => roleMatches(m, ["reviewer", "tester", "visual_reviewer"]));
     if (reviewer) {
       sendTaskToReviewer(team, reviewer, task);
     }
@@ -382,11 +444,7 @@ function autoStartTask(teamId: string, task: TeamTask): void {
   ].join("\n");
 
   try {
-    const res = sm.sendTurn(member.sessionId, prompt);
-    if (!res.ok) {
-      throw new Error(res.error ?? `Failed to start task ${task.id}`);
-    }
-    watchSessionResponse(member.sessionId, (result) => {
+    void invokeMemberTurn(member, prompt).then((result) => {
       const latest = getTask(teamId, task.id);
       if (!latest) return;
 
@@ -410,6 +468,8 @@ function autoStartTask(teamId: string, task: TeamTask): void {
         text: summary.slice(0, 2000),
       });
       updateTask(teamId, latest.id, { status: "review" });
+    }).catch((err: unknown) => {
+      log(`[team] Failed to start task for ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
     });
   } catch (err) {
     log(`[team] Failed to start task for ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -436,9 +496,7 @@ function sendTaskToReviewer(team: TeamConfig, reviewer: TeamMember, task: TeamTa
   ].join("\n");
 
   try {
-    const result = sm.sendTurn(reviewer.sessionId, prompt);
-    if (!result.ok) throw new Error(result.error ?? `Failed to send review for ${task.id}`);
-    watchSessionResponse(reviewer.sessionId, (result) => {
+    void invokeMemberTurn(reviewer, prompt).then((result) => {
       const latest = getTask(team.id, task.id);
       if (!latest) return;
 
@@ -470,6 +528,8 @@ function sendTaskToReviewer(team: TeamConfig, reviewer: TeamMember, task: TeamTa
       }
 
       updateTask(team.id, latest.id, { status: "approved" });
+    }).catch((err: unknown) => {
+      log(`[team] Failed to send review to ${reviewer.name}: ${err instanceof Error ? err.message : String(err)}`);
     });
     log(`Auto-sent review request to ${reviewer.name} for task ${task.id}`);
   } catch (err) {
@@ -499,7 +559,7 @@ export function addComment(teamId: string, taskId: string, author: string, text:
 
 function writeTeamMessage(
   teamId: string,
-  input: { from: string; to: string; text: string; fromTool?: Tool },
+  input: { from: string; to: string; text: string; fromTool?: TeamTool; orchestration?: TeamMessageOrchestration },
 ): TeamMessage {
   const team = getTeam(teamId);
   const memberTool = team?.members.find((member) => member.name === input.from)?.tool;
@@ -510,6 +570,7 @@ function writeTeamMessage(
     fromTool: input.fromTool ?? memberTool,
     to: input.to,
     text: input.text,
+    orchestration: input.orchestration,
     createdAt: nowISO(),
   };
   appendJsonl(path.join(teamDir(teamId), "messages.jsonl"), msg);
@@ -518,21 +579,19 @@ function writeTeamMessage(
 }
 
 function getCoordinator(team: TeamConfig): TeamMember | undefined {
-  return team.members.find((member) => member.role === "planner")
-    ?? team.members.find((member) => member.role === "lead")
-    ?? team.members[0];
+  return getCoordinatorMember(team);
 }
 
 function getPrimaryCoder(team: TeamConfig): TeamMember | undefined {
-  return team.members.find((member) => member.role === "coder");
+  return team.members.find((member) => roleMatches(member, ["coder", "scribe", "tester", "visual"]));
 }
 
 function getPrimaryReviewer(team: TeamConfig): TeamMember | undefined {
-  return team.members.find((member) => member.role === "reviewer");
+  return team.members.find((member) => roleMatches(member, ["reviewer", "tester", "visual_reviewer"]));
 }
 
 function getRoleExecutionGuidance(role: TeamMember["role"]): string {
-  switch (role) {
+  switch (normalizeTeamRole(role)) {
     case "coder":
       return "You are the implementation owner. Create or modify the required files yourself and deliver the concrete artifact.";
     case "reviewer":
@@ -541,6 +600,14 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
       return "You are the planner. Break down work, coordinate next steps, and only implement directly if the task explicitly requires planning artifacts.";
     case "lead":
       return "You are the lead. Coordinate, unblock, and provide final sign-off. Do not take over hands-on implementation unless the task explicitly requires it.";
+    case "scribe":
+      return "You are the scribe. Capture decisions, summarize work clearly, and turn rough findings into concise team updates.";
+    case "tester":
+      return "You are the tester. Validate behavior, run focused checks when appropriate, and report concrete pass/fail status and risks.";
+    case "visual":
+      return "You are the visual specialist. Focus on UI quality, layout, interaction details, and visible regressions.";
+    case "visual_reviewer":
+      return "You are the visual reviewer. Review UI changes for layout, clarity, polish, and visible regressions.";
     default:
       return "";
   }
@@ -599,13 +666,13 @@ function buildChatPrompt(team: TeamConfig, member: TeamMember, from: string, to:
   const coordinatorMessage = to === "*" && getCoordinator(team)?.name === member.name;
 
   const extraGuidance = [
-    member.role === "reviewer"
+    roleMatches(member, ["reviewer", "tester", "visual_reviewer"])
       ? "If the user refers to \"this plan\" or \"the plan\", assume they mean the latest team plan summarized below unless they specify otherwise."
       : "",
     coordinatorMessage
       ? "You are handling a team-level request. Coordinate using the latest plan and board context below. Delegate by role rather than taking over implementation yourself unless implementation is explicitly assigned to you."
       : "",
-    directMessage && member.role === "coder"
+    directMessage && roleMatches(member, ["coder"])
       ? "If the request is asking for implementation or file creation, treat yourself as the hands-on owner unless the latest plan clearly assigns that work to someone else."
       : "",
     "Use the team context below. Do not ask the user to paste information that is already included here.",
@@ -719,14 +786,24 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
 
   const msg = writeTeamMessage(teamId, { from, to, text });
 
-  // Team-level user messages go to the coordinator instead of blindly fanning out.
   if (to === "*") {
     if (from === "user") {
-      const coordinator = getCoordinator(team);
-      if (coordinator) {
-        injectMessage(coordinator, from, to, text, teamId);
-        return msg;
-      }
+      void runTeamOrchestrator({
+        team,
+        userText: text,
+        invokeMember: (member, prompt) => invokeMemberTurn(member, prompt, team.workingDirectory),
+        writeFinalMessage: (fromName, finalText, orchestration) => {
+          writeTeamMessage(teamId, {
+            from: fromName,
+            to: "user",
+            text: finalText.slice(0, 4000),
+            orchestration,
+          });
+        },
+        summarizePlan: (memberName) => summarizePlanForChat(teamId, memberName),
+        summarizeBoard: (memberName) => summarizeBoardForChat(teamId, memberName),
+      });
+      return msg;
     }
     for (const member of team.members) {
       if (member.name !== from) {
@@ -743,39 +820,123 @@ export function sendMessage(teamId: string, from: string, to: string, text: stri
   return msg;
 }
 
+function memberWorkingDirectory(member: TeamMember): string | undefined {
+  const session = isSessionBackedTool(member.tool) ? sm.getSession(member.sessionId) : undefined;
+  if (session?.workingDirectory) return session.workingDirectory;
+  return Object.values(sm.getState().teams ?? {})
+    .find((team) => team.members.some((teamMember) => teamMember.sessionId === member.sessionId))
+    ?.workingDirectory;
+}
+
+export type TeamMemberTurnCompletion = SessionCompletion;
+
+export type TeamMemberTurnInvoker = (
+  member: TeamMember,
+  prompt: string,
+) => Promise<TeamMemberTurnCompletion>;
+
+export function invokeTeamMemberTurn(member: TeamMember, prompt: string, cwd?: string): Promise<SessionCompletion> {
+  if (activeWatchers.has(member.sessionId)) {
+    return Promise.resolve({
+      status: "failed",
+      responseText: "",
+      errorText: `Session ${member.sessionId} for ${member.name} already has a pending watcher`,
+    });
+  }
+
+  try {
+    return executeProviderTurn({
+      member,
+      prompt,
+      cwd: cwd ?? memberWorkingDirectory(member),
+      waitForCompletion: waitForSessionCompletion,
+    }).then((result) => {
+      return {
+        status: result.status,
+        responseText: result.responseText,
+        errorText: result.errorText ?? result.error,
+        diagnosticsSummary: summarizeProviderDiagnostics(result),
+      };
+    });
+  } catch (err) {
+    log(`[team] Failed to inject message to ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
+    return Promise.resolve({
+      status: "failed",
+      responseText: "",
+      errorText: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function invokeMemberTurn(member: TeamMember, prompt: string, cwd?: string): Promise<SessionCompletion> {
+  return invokeTeamMemberTurn(member, prompt, cwd);
+}
+
+function sendPromptToMember(member: TeamMember, prompt: string, teamId: string): boolean {
+  if (activeWatchers.has(member.sessionId)) {
+    return false;
+  }
+
+  void invokeMemberTurn(member, prompt)
+    .then((completion) => {
+      const output = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
+      if (!output) return;
+      writeTeamMessage(teamId, {
+        from: member.name,
+        to: "user",
+        text: output.slice(0, 2000),
+      });
+      log(`[team] Captured response from ${member.name} (${output.length} chars)`);
+    })
+    .catch((err: unknown) => {
+      log(`[team] Failed to capture response from ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  return true;
+}
+
 function injectMessage(member: TeamMember, from: string, to: string, text: string, teamId: string): void {
   const team = getTeam(teamId);
   if (!team) return;
-  const session = sm.getSession(member.sessionId);
-  if (session && session.status === "idle") {
-    try {
-      const prompt = buildChatPrompt(team, member, from, to, text);
-      const result = sm.sendTurn(member.sessionId, prompt);
-      if (result.ok) {
-        watchSessionResponse(member.sessionId, (completion) => {
-          const output = (completion.status === "idle" ? completion.responseText : completion.errorText ?? completion.responseText).trim();
-          if (!output) return;
-          writeTeamMessage(teamId, {
-            from: member.name,
-            to: "user",
-            text: output.slice(0, 2000),
-          });
-          log(`[team] Captured response from ${member.name} (${output.length} chars)`);
-        });
-      }
-    } catch (err) {
-      log(`[team] Failed to inject message to ${member.name}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  sendPromptToMember(member, buildChatPrompt(team, member, from, to, text), teamId);
 }
 
 type SessionCompletion = {
   status: "idle" | "failed" | "cancelled" | "interrupted";
   responseText: string;
   errorText?: string;
+  diagnosticsSummary?: string;
 };
 
+function summarizeProviderDiagnostics(result: ProviderExecutionResult): string | undefined {
+  const diagnostics = result.diagnostics;
+  if (!diagnostics) return undefined;
+  const parts = [
+    `provider=${result.provider}`,
+    diagnostics.command ? `command=${diagnostics.command}` : undefined,
+    diagnostics.cwd ? `cwd=${diagnostics.cwd}` : undefined,
+    diagnostics.args ? `args=${diagnostics.args.join(" ")}` : undefined,
+    typeof diagnostics.promptLength === "number" ? `promptLength=${diagnostics.promptLength}` : undefined,
+    typeof diagnostics.modelArgApplied === "boolean" ? `modelArgApplied=${diagnostics.modelArgApplied}` : undefined,
+    typeof diagnostics.timeoutMs === "number" ? `timeoutMs=${diagnostics.timeoutMs}` : undefined,
+    typeof diagnostics.exitCode !== "undefined" ? `exitCode=${diagnostics.exitCode}` : undefined,
+    diagnostics.signal ? `signal=${diagnostics.signal}` : undefined,
+    diagnostics.timedOut ? "timedOut=true" : undefined,
+    diagnostics.error ? `error=${diagnostics.error}` : undefined,
+    diagnostics.stdoutTail ? `stdoutTail=${diagnostics.stdoutTail.replace(/\s+/g, " ").trim()}` : undefined,
+    diagnostics.stderrTail ? `stderrTail=${diagnostics.stderrTail.replace(/\s+/g, " ").trim()}` : undefined,
+    typeof diagnostics.parsedAssistantEventCount === "number" ? `parsedAssistantEventCount=${diagnostics.parsedAssistantEventCount}` : undefined,
+    diagnostics.conversationId ? `conversationId=${diagnostics.conversationId}` : undefined,
+  ].filter(Boolean);
+  return parts.join(" | ");
+}
+
 const activeWatchers = new Map<string, (result: SessionCompletion) => void>();
+
+function waitForSessionCompletion(sessionId: string): Promise<SessionCompletion> {
+  return new Promise((resolve) => {
+    watchSessionResponse(sessionId, resolve);
+  });
+}
 
 /** Poll a session until it goes idle, then capture the last turn response. */
 function watchSessionResponse(sessionId: string, onComplete: (result: SessionCompletion) => void): void {
@@ -791,7 +952,13 @@ function watchSessionResponse(sessionId: string, onComplete: (result: SessionCom
     const session = sm.getSession(sessionId);
     if (!session || polls >= maxPolls) {
       clearInterval(interval);
+      const handler = activeWatchers.get(sessionId);
       activeWatchers.delete(sessionId);
+      handler?.({
+        status: "failed",
+        responseText: "",
+        errorText: session ? `Timed out waiting for session ${sessionId}` : `Session ${sessionId} not found`,
+      });
       return;
     }
 
@@ -820,6 +987,49 @@ function watchSessionResponse(sessionId: string, onComplete: (result: SessionCom
 
 export function listMessages(teamId: string, limit?: number): TeamMessage[] {
   return readJsonl<TeamMessage>(path.join(teamDir(teamId), "messages.jsonl"), limit);
+}
+
+export async function runQueuedTeamChat(input: {
+  teamId: string;
+  from: string;
+  to: string;
+  text: string;
+  invokeMember?: TeamMemberTurnInvoker;
+  persistMessages?: boolean;
+}): Promise<TeamMessage | undefined> {
+  const team = getTeam(input.teamId);
+  if (!team) throw new Error(`Team ${input.teamId} not found`);
+  if (input.from !== "user" || input.to !== "*") {
+    throw new Error("Queued Team Chat dispatch currently supports user-to-team messages only");
+  }
+
+  const persistMessages = input.persistMessages !== false;
+  const msg = persistMessages
+    ? writeTeamMessage(input.teamId, {
+      from: input.from,
+      to: input.to,
+      text: input.text,
+    })
+    : undefined;
+
+  await runTeamOrchestrator({
+    team,
+    userText: input.text,
+    invokeMember: input.invokeMember ?? ((member, prompt) => invokeMemberTurn(member, prompt, team.workingDirectory)),
+    writeFinalMessage: (fromName, finalText, orchestration) => {
+      if (!persistMessages) return;
+      writeTeamMessage(input.teamId, {
+        from: fromName,
+        to: "user",
+        text: finalText.slice(0, 4000),
+        orchestration,
+      });
+    },
+    summarizePlan: (memberName) => summarizePlanForChat(input.teamId, memberName),
+    summarizeBoard: (memberName) => summarizeBoardForChat(input.teamId, memberName),
+  });
+
+  return msg;
 }
 
 // ── Plans ──
@@ -859,9 +1069,9 @@ function parsePlanTasksFromResponse(team: TeamConfig, responseText: string): Pla
     throw new Error("Planner response did not include tasks");
   }
 
-  const fallbackOwner = team.members.find((member) => member.role === "coder")
+  const fallbackOwner = team.members.find((member) => roleMatches(member, ["coder", "scribe", "tester", "visual"]))
     ?.name
-    ?? team.members.find((member) => member.role === "planner" || member.role === "lead")
+    ?? getCoordinator(team)
       ?.name
     ?? team.members[0]?.name
     ?? "unassigned";
@@ -946,9 +1156,7 @@ export function generatePlan(
   const team = getTeam(teamId);
   if (!team) throw new Error(`Team ${teamId} not found`);
 
-  const planner = team.members.find((member) => member.role === "planner")
-    ?? team.members.find((member) => member.role === "lead")
-    ?? team.members[0];
+  const planner = getCoordinator(team);
   if (!planner) throw new Error(`Team ${teamId} has no members`);
 
   writeTeamMessage(teamId, {
@@ -957,12 +1165,7 @@ export function generatePlan(
     text: request,
   });
 
-  const result = sm.sendTurn(planner.sessionId, buildPlanGenerationPrompt(team, request));
-  if (!result.ok) {
-    throw new Error(result.error ?? `Failed to generate plan for ${teamId}`);
-  }
-
-  watchSessionResponse(planner.sessionId, (result) => {
+  void invokeMemberTurn(planner, buildPlanGenerationPrompt(team, request)).then((result) => {
     if (result.status !== "idle") {
       writeTeamMessage(teamId, {
         from: planner.name,
@@ -986,6 +1189,12 @@ export function generatePlan(
         text: `Plan generation failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
       });
     }
+  }).catch((err: unknown) => {
+    writeTeamMessage(teamId, {
+      from: planner.name,
+      to: "team",
+      text: `Plan generation failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
+    });
   });
 
   log(`Plan generation requested for team ${teamId} via ${planner.name}`);
@@ -1004,7 +1213,7 @@ export function submitPlan(
   const planId = newId("plan");
   const now = nowISO();
   const mode = opts?.mode ?? "simple";
-  const reviewers = opts?.reviewers ?? team.members.filter((m) => m.role === "reviewer").map((m) => m.name);
+  const reviewers = opts?.reviewers ?? team.members.filter((m) => roleMatches(m, ["reviewer", "tester", "visual_reviewer"])).map((m) => m.name);
   const maxIterations = opts?.maxIterations ?? 5;
 
   const revision: PlanRevision = {
@@ -1252,9 +1461,7 @@ function sendToReviewer(team: TeamConfig, reviewerName: string, prompt: string):
   const member = team.members.find((m) => m.name === reviewerName);
   if (member) {
     try {
-      const result = sm.sendTurn(member.sessionId, prompt);
-      if (!result.ok) throw new Error(result.error ?? `Failed to send to ${reviewerName}`);
-      watchSessionResponse(member.sessionId, (result) => {
+      void invokeMemberTurn(member, prompt).then((result) => {
         const latestPlan = getLatestPlan(team.id);
         if (!latestPlan || latestPlan.status !== "review") return;
         if (result.status !== "idle") {
@@ -1280,6 +1487,12 @@ function sendToReviewer(team: TeamConfig, reviewerName: string, prompt: string):
           text: `${decision.decision.toUpperCase()} ${latestPlan.id}${decision.feedback ? ` — ${decision.feedback}` : ""}`.slice(0, 2000),
         });
         reviewPlan(team.id, latestPlan.id, reviewerName, decision.decision, decision.feedback);
+      }).catch((err: unknown) => {
+        writeTeamMessage(team.id, {
+          from: reviewerName,
+          to: "team",
+          text: `Plan review failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
+        });
       });
     } catch {
       log(`[team] Failed to send to reviewer ${reviewerName}`);
@@ -1294,8 +1507,7 @@ function sendRevisionRequest(
   feedbacks: Array<{ reviewer: string; feedback: string }>,
 ): void {
   const planner = team.members.find((m) => m.name === plan.createdBy)
-    ?? team.members.find((m) => m.role === "planner")
-    ?? team.members.find((m) => m.role === "lead");
+    ?? getCoordinator(team);
   if (!planner) return;
 
   const feedbackList = feedbacks.map((f) => `- ${f.reviewer}: ${f.feedback}`).join("\n");
@@ -1307,9 +1519,7 @@ ${feedbackList}
 Please submit a revised plan addressing this feedback.`;
 
   try {
-    const result = sm.sendTurn(planner.sessionId, prompt);
-    if (!result.ok) throw new Error(result.error ?? `Failed to send revision request to ${planner.name}`);
-    watchSessionResponse(planner.sessionId, (result) => {
+    void invokeMemberTurn(planner, prompt).then((result) => {
       if (result.status !== "idle") {
         writeTeamMessage(team.id, {
           from: planner.name,
@@ -1333,6 +1543,12 @@ Please submit a revised plan addressing this feedback.`;
           text: `Revision for ${plan.id} could not be parsed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
         });
       }
+    }).catch((err: unknown) => {
+      writeTeamMessage(team.id, {
+        from: planner.name,
+        to: "team",
+        text: `Revision for ${plan.id} failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000),
+      });
     });
   } catch {
     log(`[team] Failed to send to planner ${planner.name}`);

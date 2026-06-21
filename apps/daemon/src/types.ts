@@ -1,6 +1,18 @@
+import type { TeamMetadata } from "./teamMetadata.js";
+import type {
+  ModelResourceStatus,
+  ModelResourceStatusSummary,
+  TeamQueueDispatchResult,
+  TeamQueueRun,
+  TeamQueueStatusSummary,
+  TeamQueueTask,
+  TeamBoardItem,
+} from "./teamQueueTypes.js";
+
 // ── Session & State ──
 
 export type Tool = "claude" | "codex" | "gemini";
+export type TeamTool = Tool | "opencode" | "openhands";
 export type SessionExecutionBackend = "cli" | "codex_app_server";
 
 export type SessionStatus =
@@ -247,6 +259,15 @@ export interface IpcResponse {
   teams?: TeamConfig[];
   teamTasks?: TeamTask[];
   teamTask?: TeamTask;
+  boardItems?: TeamBoardItem[];
+  boardItem?: TeamBoardItem;
+  queueTasks?: TeamQueueTask[];
+  queueTask?: TeamQueueTask;
+  queueRuns?: TeamQueueRun[];
+  queueRun?: TeamQueueRun;
+  queueTaskId?: string;
+  queueRunIds?: string[];
+  deletedAt?: string;
   teamMessages?: TeamMessage[];
   teamPlan?: TeamPlan;
   timedOut?: boolean;
@@ -255,6 +276,13 @@ export interface IpcResponse {
   activeSessions?: number;
   totalSessions?: number;
   tools?: Record<string, boolean>;
+  teamMetadata?: TeamMetadata;
+  queueStatus?: TeamQueueStatusSummary;
+  queueDispatch?: TeamQueueDispatchResult;
+  resourceStatus?: ModelResourceStatus | ModelResourceStatusSummary;
+  orchestrator?: { available: boolean; enabled: boolean; provider: string; runStore: boolean };
+  orchestratorRuns?: unknown[];
+  orchestratorRun?: unknown;
   bridgeUrl?: string;
   bridgeToken?: string;
   bridgeStatus?: { enabled: boolean; port: number; tls: boolean; bindHost: string; connections: number };
@@ -328,14 +356,32 @@ export interface SessionEventRecord {
 
 // ── Agent Teams ──
 
-export type AgentRole = "lead" | "coder" | "reviewer" | "planner";
+export type AgentRole =
+  | "lead"
+  | "coder"
+  | "reviewer"
+  | "planner"
+  | "scribe"
+  | "tester"
+  | "visual"
+  | "visual_reviewer"
+  | "domain_specialist"
+  | (string & {});
 
 export interface TeamMember {
   name: string;
-  tool: Tool;
+  tool: TeamTool;
   model?: string;
   role: AgentRole;
   sessionId: string;
+}
+
+export interface TeamRoutingPolicy {
+  maxCycles?: number;
+  maxTasksPerCycle?: number;
+  maxParallelTasks?: number;
+  requireReviewForWrites?: boolean;
+  defaultReadOnly?: boolean;
 }
 
 export type TaskStatus = "todo" | "in_progress" | "done" | "review" | "approved";
@@ -365,10 +411,29 @@ export interface TeamMessage {
   id: string;
   teamId: string;
   from: string;
-  fromTool?: Tool;
+  fromTool?: TeamTool;
   to: string;
   text: string;
   createdAt: string;
+  orchestration?: TeamMessageOrchestration;
+}
+
+export interface TeamMessageOrchestration {
+  runId: string;
+  teamId: string;
+  status: "completed" | "blocked" | "failed";
+  route: string[];
+  routeSummary: string;
+  timeline: Array<{
+    memberName?: string;
+    role?: string;
+    tool?: TeamTool;
+    model?: string;
+    status?: "started" | "completed" | "blocked" | "failed";
+    durationMs?: number;
+    summary?: string;
+    diagnostics?: string;
+  }>;
 }
 
 export interface TeamConfig {
@@ -376,6 +441,7 @@ export interface TeamConfig {
   name: string;
   workingDirectory: string;
   members: TeamMember[];
+  routingPolicy?: TeamRoutingPolicy;
   taskCount?: number;
   tasksTotal?: number;
   tasksDone?: number;
