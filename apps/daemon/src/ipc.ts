@@ -27,6 +27,7 @@ import {
   getTeamQueueTask,
   listTeamQueueRuns,
   listTeamQueueTasks,
+  updateTeamQueueItemPriority,
 } from "./teamQueueStore.js";
 import {
   cancelTeamBoardItem,
@@ -37,6 +38,7 @@ import {
 } from "./teamBoardStore.js";
 import { getResourceStatus, listResourceStatus, modelResourceKey } from "./modelResourceScheduler.js";
 import { dispatchTeamQueueOnce, getTeamQueueDispatchStatus } from "./teamQueueDispatcher.js";
+import { disableQueueWorker, enableQueueWorker, getQueueWorkerStatus, tickQueueWorkerOnce } from "./teamQueueWorker.js";
 import type { ProviderDetectionInfo } from "./agentProviders.js";
 import type { TeamBoardReviewStatus, TeamQueueRun, TeamQueueTaskSource } from "./teamQueueTypes.js";
 
@@ -865,6 +867,22 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       return { ok: true, queueStatus: getTeamQueueStatus(teamId) };
     }
 
+    case "queue.worker.status": {
+      return { ok: true, queueWorkerStatus: getQueueWorkerStatus() };
+    }
+
+    case "queue.worker.enable": {
+      return { ok: true, queueWorkerStatus: enableQueueWorker() };
+    }
+
+    case "queue.worker.disable": {
+      return { ok: true, queueWorkerStatus: disableQueueWorker() };
+    }
+
+    case "queue.worker.tick_once": {
+      return { ok: true, queueWorkerStatus: await tickQueueWorkerOnce() };
+    }
+
     case "team.queue.dispatch_once": {
       try {
         return { ok: true, queueDispatch: await dispatchTeamQueueOnce() };
@@ -876,6 +894,45 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
     case "team.queue.dispatch_status": {
       try {
         return { ok: true, queueDispatch: getTeamQueueDispatchStatus() };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    case "global.queue.item.set_priority":
+    case "global.queue.item.move_to_top":
+    case "global.queue.item.move_to_bottom": {
+      const queueTaskId = stringValue(req.queueTaskId) ?? stringValue(req.taskId);
+      const queueRunId = stringValue(req.queueRunId) ?? stringValue(req.runId);
+      const priority = typeof req.priority === "number" && Number.isFinite(req.priority) ? req.priority : undefined;
+      const move = req.cmd === "global.queue.item.move_to_top"
+        ? "top"
+        : req.cmd === "global.queue.item.move_to_bottom"
+          ? "bottom"
+          : undefined;
+      try {
+        const updated = updateTeamQueueItemPriority({
+          teamId: stringValue(req.teamId),
+          queueTaskId,
+          queueRunId,
+          priority,
+          move,
+        });
+        if (!updated.ok) return { ok: false, error: updated.error };
+        const queueTask = updated.queueTaskId ? updated.state.tasks[updated.queueTaskId] : undefined;
+        const queueRuns = updated.queueRunIds
+          .map((runId) => updated.state.runs[runId])
+          .filter((run): run is TeamQueueRun => Boolean(run));
+        return {
+          ok: true,
+          queueTaskId: updated.queueTaskId,
+          queueRunIds: updated.queueRunIds,
+          queueTask,
+          queueTasks: queueTask ? [queueTask] : undefined,
+          queueRun: queueRuns[0],
+          queueRuns,
+          queueStatus: getTeamQueueStatus(stringValue(req.teamId)),
+        };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }

@@ -3,6 +3,7 @@ import type {
   ModelResourceStatus,
   ModelResourceStatusSummary,
   TeamQueueDispatchResult,
+  TeamQueueWorkerStatus,
   TeamQueueRun,
   TeamQueueStatusSummary,
   TeamQueueTask,
@@ -279,6 +280,7 @@ export interface IpcResponse {
   teamMetadata?: TeamMetadata;
   queueStatus?: TeamQueueStatusSummary;
   queueDispatch?: TeamQueueDispatchResult;
+  queueWorkerStatus?: TeamQueueWorkerStatus;
   resourceStatus?: ModelResourceStatus | ModelResourceStatusSummary;
   orchestrator?: { available: boolean; enabled: boolean; provider: string; runStore: boolean };
   orchestratorRuns?: unknown[];

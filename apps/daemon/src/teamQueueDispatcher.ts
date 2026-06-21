@@ -8,6 +8,7 @@ import {
   getTeamQueueStatePath,
   getTeamQueueStatus,
   loadTeamQueueState,
+  compareQueueItems,
   updateTeamQueueState,
   type TeamQueueStoreOptions,
 } from "./teamQueueStore.js";
@@ -173,11 +174,7 @@ function sortedDispatchableRuns(state: TeamQueueState): Array<{ task: TeamQueueT
       }
       return DISPATCHABLE_RUN_STATUSES.has(run.status);
     })
-    .sort((left, right) => {
-      const priorityDiff = (right.task.priority ?? 50) - (left.task.priority ?? 50);
-      if (priorityDiff !== 0) return priorityDiff;
-      return left.task.createdAt.localeCompare(right.task.createdAt);
-    });
+    .sort(compareQueueItems);
 }
 
 function teamHasActiveRun(state: TeamQueueState, teamId: string, exceptRunId?: string): boolean {
@@ -551,7 +548,7 @@ async function executeRun(
 export async function dispatchTeamQueueOnce(options?: TeamQueueDispatcherOptions): Promise<TeamQueueDispatchResult> {
   const ctx: DispatchContext = { options, events: [] };
   const getTeam = options?.getTeam ?? tm.getTeam;
-  const initialState = loadTeamQueueState(options);
+  const initialState = loadTeamQueueState(activeOptions(options));
   const candidates = sortedDispatchableRuns(initialState);
   const plannedTeams = new Set<string>();
   const plannedResources = new Set<string>();
@@ -622,7 +619,7 @@ export function getTeamQueueDispatchStatus(options?: TeamQueueDispatcherOptions)
   queueStatus: ReturnType<typeof getTeamQueueStatus>;
   resourceStatus: ReturnType<typeof listResourceStatus>;
 } {
-  const state = loadTeamQueueState(options);
+  const state = loadTeamQueueState(activeOptions(options));
   const dispatchable = sortedDispatchableRuns(state).map(({ run }) => run.id);
   return {
     statePath: options?.statePath ?? getTeamQueueStatePath(),

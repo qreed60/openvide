@@ -16,6 +16,8 @@ import type {
   TeamQueueTaskStatus,
   TeamQueueTurn,
   TeamQueueTurnStatus,
+  UpdateTeamQueuePriorityInput,
+  UpdateTeamQueuePriorityResult,
 } from "./teamQueueTypes.js";
 
 const QUEUE_STATE_FILE = "team-queue.json";
@@ -84,6 +86,67 @@ function isRunningTurn(turn: TeamQueueTurn): boolean {
 
 function isDeletedRecord(record: { deletedAt?: string; visibility?: string }): boolean {
   return Boolean(record.deletedAt) || record.visibility === "deleted";
+}
+
+const DEFAULT_QUEUE_PRIORITY = 50;
+const QUEUE_ORDER_STEP = 1000;
+const REORDERABLE_TASK_STATUSES = new Set<TeamQueueTaskStatus>(["queued", "ready"]);
+const REORDERABLE_RUN_STATUSES = new Set<TeamQueueRunStatus>([
+  "queued",
+  "waiting_for_team_slot",
+  "waiting_for_model",
+]);
+
+export function queuePriority(task?: Pick<TeamQueueTask, "priority">, run?: Pick<TeamQueueRun, "priority" | "metadata">): number {
+  const taskPriority = task?.priority;
+  if (typeof taskPriority === "number" && Number.isFinite(taskPriority)) return taskPriority;
+  const runPriority = run?.priority;
+  if (typeof runPriority === "number" && Number.isFinite(runPriority)) return runPriority;
+  const metadataPriority = run?.metadata?.priority;
+  return typeof metadataPriority === "number" && Number.isFinite(metadataPriority)
+    ? metadataPriority
+    : DEFAULT_QUEUE_PRIORITY;
+}
+
+function timestampOrder(value: string | undefined): number {
+  const parsed = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function queueOrderValue(task?: Pick<TeamQueueTask, "queueOrder" | "createdAt">, run?: Pick<TeamQueueRun, "queueOrder" | "createdAt">): number {
+  const taskOrder = task?.queueOrder;
+  if (typeof taskOrder === "number" && Number.isFinite(taskOrder)) return taskOrder;
+  const runOrder = run?.queueOrder;
+  if (typeof runOrder === "number" && Number.isFinite(runOrder)) return runOrder;
+  return timestampOrder(task?.createdAt ?? run?.createdAt);
+}
+
+export function compareQueueItems(
+  left: { task?: TeamQueueTask; run: TeamQueueRun },
+  right: { task?: TeamQueueTask; run: TeamQueueRun },
+): number {
+  const priorityDiff = queuePriority(right.task, right.run) - queuePriority(left.task, left.run);
+  if (priorityDiff !== 0) return priorityDiff;
+  const orderDiff = queueOrderValue(left.task, left.run) - queueOrderValue(right.task, right.run);
+  if (orderDiff !== 0) return orderDiff;
+  return (left.task?.createdAt ?? left.run.createdAt).localeCompare(right.task?.createdAt ?? right.run.createdAt);
+}
+
+export function queueItemReorderBlockedReason(task: TeamQueueTask | undefined, run: TeamQueueRun | undefined): string | undefined {
+  if (!run) return "Queue run not found";
+  if (!task) return "Queue task not found";
+  if (isDeletedRecord(task) || isDeletedRecord(run)) return "Queue item is deleted";
+  if (task.source === "board" && typeof task.metadata?.board === "object") {
+    const board = task.metadata.board as { executionStatus?: unknown };
+    if (board.executionStatus === "draft") return "Queue item is draft";
+  }
+  if (!REORDERABLE_TASK_STATUSES.has(task.status)) return `Queue task status ${task.status} cannot be reordered`;
+  if (!REORDERABLE_RUN_STATUSES.has(run.status)) return `Queue run status ${run.status} cannot be reordered`;
+  return undefined;
+}
+
+export function isQueueItemReorderable(task: TeamQueueTask | undefined, run: TeamQueueRun | undefined): boolean {
+  return queueItemReorderBlockedReason(task, run) === undefined;
 }
 
 function recoverStaleActiveState(state: TeamQueueState): { state: TeamQueueState; changed: boolean } {
@@ -227,7 +290,8 @@ export function createTeamQueueTask(
   const route = cleanMembers(input.assignedMemberNames);
   const priority = typeof input.priority === "number" && Number.isFinite(input.priority)
     ? input.priority
-    : 50;
+    : DEFAULT_QUEUE_PRIORITY;
+  const queueOrder = timestampOrder(now);
 
   const task: TeamQueueTask = {
     id: taskId,
@@ -243,6 +307,7 @@ export function createTeamQueueTask(
     sourceRef: input.sourceRef,
     runIds: [runId],
     priority,
+    queueOrder,
     metadata: input.metadata,
   };
 
@@ -257,9 +322,12 @@ export function createTeamQueueTask(
     queuedAt: now,
     attempt: 1,
     turnIds: [],
+    priority,
+    queueOrder,
     metadata: {
       source: input.source,
       priority,
+      queueOrder,
       ...(input.metadata ?? {}),
     },
   };
@@ -471,6 +539,116 @@ export function deleteTeamQueueItem(
   return { ...result, state };
 }
 
+function linkedRunsForTask(state: TeamQueueState, task: TeamQueueTask): TeamQueueRun[] {
+  const linked = new Map<string, TeamQueueRun>();
+  for (const run of Object.values(state.runs)) {
+    if (runBelongsToTask(run, task)) linked.set(run.id, run);
+  }
+  for (const runId of task.runIds) {
+    const run = state.runs[runId];
+    if (run) linked.set(run.id, run);
+  }
+  return [...linked.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+function peerQueueOrdersForPriority(state: TeamQueueState, priority: number, excludeTaskId: string): number[] {
+  return Object.values(state.tasks)
+    .filter((task) => task.id !== excludeTaskId)
+    .flatMap((task) => linkedRunsForTask(state, task).map((run) => ({ task, run })))
+    .filter(({ task, run }) => isQueueItemReorderable(task, run))
+    .filter(({ task, run }) => queuePriority(task, run) === priority)
+    .map(({ task, run }) => queueOrderValue(task, run));
+}
+
+function syncTaskPriorityToRuns(task: TeamQueueTask, runs: TeamQueueRun[], timestamp: string): void {
+  for (const run of runs) {
+    run.priority = task.priority;
+    run.queueOrder = task.queueOrder;
+    run.updatedAt = timestamp;
+    run.metadata = {
+      ...(run.metadata ?? {}),
+      priority: task.priority,
+      queueOrder: task.queueOrder,
+    };
+  }
+}
+
+export function updateTeamQueueItemPriority(
+  input: UpdateTeamQueuePriorityInput,
+  options?: TeamQueueStoreOptions,
+): UpdateTeamQueuePriorityResult {
+  const operationOptions: TeamQueueStoreOptions = { ...options, recoverStaleActive: false };
+  const queueTaskId = cleanString(input.queueTaskId);
+  const queueRunId = cleanString(input.queueRunId);
+  const requestedTeamId = cleanString(input.teamId);
+  const nextPriority = typeof input.priority === "number" && Number.isFinite(input.priority)
+    ? input.priority
+    : undefined;
+  if (!queueTaskId && !queueRunId) {
+    return { ok: false, queueRunIds: [], state: loadTeamQueueState(operationOptions), error: "Missing required: queueTaskId or queueRunId" };
+  }
+  if (nextPriority === undefined && !input.move) {
+    return { ok: false, queueRunIds: [], state: loadTeamQueueState(operationOptions), error: "Missing required: priority or move" };
+  }
+
+  let result: Omit<UpdateTeamQueuePriorityResult, "state"> = { ok: false, queueRunIds: [] };
+  const state = updateTeamQueueState((draft) => {
+    const run = queueRunId ? draft.runs[queueRunId] : undefined;
+    const task = queueTaskId ? draft.tasks[queueTaskId] : run ? draft.tasks[run.taskId] : undefined;
+    const primaryRun = run ?? (task ? linkedRunsForTask(draft, task)[0] : undefined);
+    if (!task || !primaryRun) {
+      result = {
+        ok: false,
+        queueRunIds: [],
+        error: queueTaskId ? `Queue task ${queueTaskId} not found` : `Queue run ${queueRunId} not found`,
+      };
+      return;
+    }
+    if (requestedTeamId && task.teamId !== requestedTeamId) {
+      result = { ok: false, queueRunIds: [], error: `Queue task ${task.id} does not belong to team ${requestedTeamId}` };
+      return;
+    }
+    const blockedReason = queueItemReorderBlockedReason(task, primaryRun);
+    if (blockedReason) {
+      result = { ok: false, queueTaskId: task.id, queueRunIds: [primaryRun.id], error: blockedReason };
+      return;
+    }
+
+    const timestamp = nowISO();
+    task.priority = nextPriority ?? queuePriority(task, primaryRun);
+    if (input.move === "top" || input.move === "bottom") {
+      const peerOrders = peerQueueOrdersForPriority(draft, task.priority, task.id);
+      if (input.move === "top") {
+        const minOrder = peerOrders.length > 0 ? Math.min(...peerOrders) : queueOrderValue(task, primaryRun);
+        task.queueOrder = minOrder - QUEUE_ORDER_STEP;
+      } else {
+        const maxOrder = peerOrders.length > 0 ? Math.max(...peerOrders) : queueOrderValue(task, primaryRun);
+        task.queueOrder = maxOrder + QUEUE_ORDER_STEP;
+      }
+    } else {
+      task.queueOrder = queueOrderValue(task, primaryRun);
+    }
+    task.updatedAt = timestamp;
+    task.metadata = {
+      ...(task.metadata ?? {}),
+      priority: task.priority,
+      queueOrder: task.queueOrder,
+    };
+
+    const linkedRuns = linkedRunsForTask(draft, task);
+    syncTaskPriorityToRuns(task, linkedRuns, timestamp);
+    result = {
+      ok: true,
+      queueTaskId: task.id,
+      queueRunIds: linkedRuns.map((linkedRun) => linkedRun.id).sort(),
+      priority: task.priority,
+      queueOrder: task.queueOrder,
+    };
+  }, operationOptions);
+
+  return { ...result, state };
+}
+
 export function listTeamQueueRuns(teamId?: string, options?: TeamQueueStoreOptions): TeamQueueRun[] {
   return Object.values(loadTeamQueueState(options).runs)
     .filter((run) => belongsToTeam(run, teamId))
@@ -508,6 +686,10 @@ export function summarizeTeamQueueState(
   const turns = allTurns.filter((turn) => !isDeletedRecord(turn));
   const teamResourceKeys = new Set(turns.map((turn) => turn.resourceKey));
   const resources = Object.values(state.resources).filter((resource) => !options?.teamId || teamResourceKeys.has(resource.key));
+  const orderedItems = runs
+    .map((run) => ({ run, task: state.tasks[run.taskId] }))
+    .filter(({ task }) => !task || !isDeletedRecord(task))
+    .sort(compareQueueItems);
 
   for (const task of tasks) {
     increment(taskStatusCounts, task.status);
@@ -521,6 +703,27 @@ export function summarizeTeamQueueState(
     statePath: options?.statePath ?? getTeamQueueStatePath(),
     updatedAt: state.updatedAt,
     teamId: options?.teamId,
+    items: orderedItems.map(({ task, run }, index) => {
+      const reorderBlockedReason = queueItemReorderBlockedReason(task, run);
+      return {
+        queueTaskId: task?.id,
+        queueRunId: run.id,
+        teamId: run.teamId,
+        source: task?.source,
+        title: task?.title,
+        status: run.status,
+        taskStatus: task?.status,
+        priority: queuePriority(task, run),
+        queueOrder: task?.queueOrder ?? run.queueOrder,
+        rank: index + 1,
+        createdAt: task?.createdAt ?? run.createdAt,
+        queuedAt: task?.queuedAt ?? run.queuedAt,
+        startedAt: run.startedAt ?? task?.startedAt,
+        finishedAt: run.finishedAt ?? task?.finishedAt,
+        reorderable: !reorderBlockedReason,
+        reorderBlockedReason,
+      };
+    }),
     tasks: {
       total: tasks.length,
       byStatus: taskStatusCounts,

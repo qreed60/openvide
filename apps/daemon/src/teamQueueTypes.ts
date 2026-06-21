@@ -78,6 +78,7 @@ export interface TeamQueueTask {
   };
   runIds: string[];
   priority?: number;
+  queueOrder?: number;
   metadata?: Record<string, unknown>;
   deletedAt?: string;
   deletedBy?: string;
@@ -101,6 +102,8 @@ export interface TeamQueueRun {
   finishedAt?: string;
   attempt: number;
   turnIds: string[];
+  priority?: number;
+  queueOrder?: number;
   error?: string;
   metadata?: Record<string, unknown>;
   deletedAt?: string;
@@ -235,6 +238,7 @@ export interface TeamQueueStatusSummary {
   statePath: string;
   updatedAt: string;
   teamId?: string;
+  items: TeamQueueStatusItem[];
   tasks: {
     total: number;
     byStatus: Partial<Record<TeamQueueTaskStatus, number>>;
@@ -259,6 +263,25 @@ export interface TeamQueueStatusSummary {
     runs: number;
     turns: number;
   };
+}
+
+export interface TeamQueueStatusItem {
+  queueTaskId?: string;
+  queueRunId: string;
+  teamId: string;
+  source?: TeamQueueTaskSource;
+  title?: string;
+  status: TeamQueueRunStatus;
+  taskStatus?: TeamQueueTaskStatus;
+  priority: number;
+  queueOrder?: number;
+  rank: number;
+  createdAt: string;
+  queuedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  reorderable: boolean;
+  reorderBlockedReason?: string;
 }
 
 export interface CreateTeamQueueTaskInput {
@@ -286,6 +309,24 @@ export interface DeleteTeamQueueItemResult {
   queueTaskId?: string;
   queueRunIds: string[];
   deletedAt?: string;
+  state: TeamQueueState;
+  error?: string;
+}
+
+export interface UpdateTeamQueuePriorityInput {
+  teamId?: string;
+  queueTaskId?: string;
+  queueRunId?: string;
+  priority?: number;
+  move?: "top" | "bottom";
+}
+
+export interface UpdateTeamQueuePriorityResult {
+  ok: boolean;
+  queueTaskId?: string;
+  queueRunIds: string[];
+  priority?: number;
+  queueOrder?: number;
   state: TeamQueueState;
   error?: string;
 }
@@ -322,4 +363,14 @@ export interface TeamQueueDispatchResult {
   failedRunIds: string[];
   skippedRunIds: string[];
   events: TeamQueueDispatchEvent[];
+}
+
+export interface TeamQueueWorkerStatus {
+  enabled: boolean;
+  running: boolean;
+  intervalMs: number;
+  startedAt?: string;
+  lastTickAt?: string;
+  lastDispatchResult?: TeamQueueDispatchResult;
+  lastError?: string;
 }
