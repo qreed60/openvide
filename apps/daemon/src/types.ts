@@ -268,6 +268,9 @@ export interface IpcResponse {
   queueRun?: TeamQueueRun;
   queueTaskId?: string;
   queueRunIds?: string[];
+  clientMessageId?: string;
+  idempotent?: boolean;
+  reused?: boolean;
   deletedAt?: string;
   teamMessages?: TeamMessage[];
   teamPlan?: TeamPlan;

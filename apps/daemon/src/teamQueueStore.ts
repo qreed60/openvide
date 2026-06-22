@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { daemonDir, newId, nowISO } from "./utils.js";
 import type {
+  CreateIdempotentTeamChatQueueTaskInput,
   CreateTeamQueueTaskInput,
   DeleteTeamQueueItemInput,
   DeleteTeamQueueItemResult,
@@ -338,6 +339,52 @@ export function createTeamQueueTask(
   }, options);
 
   return { task: state.tasks[task.id] ?? task, run: state.runs[run.id] ?? run, state };
+}
+
+function metadataClientMessageId(task: TeamQueueTask): string | undefined {
+  const metadataValue = task.metadata?.clientMessageId;
+  if (typeof metadataValue === "string" && metadataValue.trim()) return metadataValue.trim();
+  const sourceRefValue = task.sourceRef?.messageId;
+  return sourceRefValue?.trim() || undefined;
+}
+
+export function createIdempotentTeamChatQueueTask(
+  input: CreateIdempotentTeamChatQueueTaskInput,
+  options?: TeamQueueStoreOptions,
+): { task: TeamQueueTask; run: TeamQueueRun; state: TeamQueueState; reused: boolean } {
+  const teamId = cleanString(input.teamId);
+  const clientMessageId = cleanString(input.clientMessageId);
+  if (!teamId || !clientMessageId) {
+    const created = createTeamQueueTask(input, options);
+    return { ...created, reused: false };
+  }
+
+  const state = loadTeamQueueState(options);
+  const existingTask = Object.values(state.tasks)
+    .filter((task) => task.teamId === teamId && task.source === "chat")
+    .find((task) => metadataClientMessageId(task) === clientMessageId);
+  if (existingTask) {
+    const existingRun = existingTask.runIds
+      .map((runId) => state.runs[runId])
+      .find((run): run is TeamQueueRun => Boolean(run))
+      ?? Object.values(state.runs).find((run) => run.taskId === existingTask.id);
+    if (existingRun) {
+      return { task: existingTask, run: existingRun, state, reused: true };
+    }
+  }
+
+  const created = createTeamQueueTask({
+    ...input,
+    sourceRef: {
+      ...(input.sourceRef ?? {}),
+      messageId: input.sourceRef?.messageId ?? clientMessageId,
+    },
+    metadata: {
+      ...(input.metadata ?? {}),
+      clientMessageId,
+    },
+  }, options);
+  return { ...created, reused: false };
 }
 
 export function listTeamQueueTasks(teamId?: string, options?: TeamQueueStoreOptions): TeamQueueTask[] {

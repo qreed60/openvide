@@ -296,6 +296,11 @@ export interface CreateTeamQueueTaskInput {
   metadata?: Record<string, unknown>;
 }
 
+export interface CreateIdempotentTeamChatQueueTaskInput extends CreateTeamQueueTaskInput {
+  source: "chat";
+  clientMessageId?: string;
+}
+
 export interface DeleteTeamQueueItemInput {
   teamId?: string;
   queueTaskId?: string;

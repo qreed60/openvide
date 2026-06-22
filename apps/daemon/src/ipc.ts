@@ -20,6 +20,7 @@ import { getTeamOrchestratorStatus } from "./teamOrchestrator.js";
 import { getTeamMetadata } from "./teamMetadata.js";
 import {
   cancelTeamQueueTask,
+  createIdempotentTeamChatQueueTask,
   createTeamQueueTask,
   deleteTeamQueueItem,
   getTeamQueueRun,
@@ -202,9 +203,11 @@ function planQueueMetadata(req: IpcRequest): Record<string, unknown> {
 }
 
 function chatQueueMetadata(req: IpcRequest): Record<string, unknown> {
+  const clientMessageId = stringValue(req.clientMessageId) ?? stringValue(req.messageId);
   return {
     from: stringValue(req.from) ?? "user",
     to: stringValue(req.to) ?? "*",
+    clientMessageId,
   };
 }
 
@@ -1253,7 +1256,8 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
       }
       try {
         const title = stringValue(req.title) ?? `Team chat: ${text.slice(0, 80)}`;
-        const queued = createTeamQueueTask({
+        const clientMessageId = stringValue(req.clientMessageId) ?? stringValue(req.messageId);
+        const queued = createIdempotentTeamChatQueueTask({
           teamId,
           source: "chat",
           title,
@@ -1262,14 +1266,22 @@ export async function routeCommand(req: IpcRequest): Promise<IpcResponse> {
           priority: numberValue(req.priority, 50),
           createdBy: stringValue(req.from) ?? stringValue(req.createdBy) ?? "user",
           sourceRef: {
-            messageId: stringValue(req.messageId),
+            messageId: clientMessageId,
           },
           metadata: {
             producerCommand: "team.chat.queue",
             ...chatQueueMetadata(req),
           },
+          clientMessageId,
         });
-        return { ok: true, queueTask: queued.task, queueRun: queued.run };
+        return {
+          ok: true,
+          queueTask: queued.task,
+          queueRun: queued.run,
+          idempotent: queued.reused,
+          reused: queued.reused,
+          clientMessageId,
+        };
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
