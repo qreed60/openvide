@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT, SCRIBE_ROLE_PROMPT } from "./rolePrompts.js";
+import {
+  CODER_ROLE_PROMPT,
+  LEAD_ROLE_PROMPT,
+  REVIEWER_ROLE_PROMPT,
+  SCRIBE_ROLE_PROMPT,
+  VISUAL_REVIEWER_ROLE_PROMPT,
+} from "./rolePrompts.js";
 import type { TeamConfig } from "./types.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openvide-team-board-execution-"));
@@ -83,6 +89,18 @@ function makeScribeTeam(id: string, model: string): TeamConfig {
     model,
     role: "scribe",
     sessionId: `session_${id}_scribe`,
+  });
+  return team;
+}
+
+function makeVisualReviewerTeam(id: string, model: string, role: "reviewer" | "visual_reviewer" = "visual_reviewer"): TeamConfig {
+  const team = makeTeam(id, model);
+  team.members.push({
+    name: "Visual Reviewer",
+    tool: "codex",
+    model,
+    role,
+    sessionId: `session_${id}_visual_reviewer`,
   });
   return team;
 }
@@ -172,6 +190,17 @@ function smokeReviewerRolePromptContract(): void {
   assert.ok(REVIEWER_ROLE_PROMPT.includes("Do not perform implementation as Coder."));
   assert.ok(REVIEWER_ROLE_PROMPT.includes("Do not act as Lead; return Reviewer findings and recommendation to Lead."));
   assert.ok(REVIEWER_ROLE_PROMPT.includes("If blocked by missing context, missing diffs, missing queue/run metadata, or missing validation output"));
+}
+
+function smokeVisualReviewerRolePromptContract(): void {
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("You are Visual Reviewer."));
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("Do not claim visual validation passed unless screenshots, rendered UI output, image artifacts, or equivalent visual evidence were actually inspected."));
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("Stay read-only unless the delegated task explicitly says to modify files."));
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("Check accessibility, readability, layout stability, spacing, alignment, responsive fit, contrast, visible state coverage, and content accuracy against the available visual evidence."));
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("No-code-implementation rule: do not implement code as Coder."));
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("No-general-review-signoff rule: do not perform general final review, approval, QA sign-off, or final sign-off as Reviewer unless specifically delegated visual review."));
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("Do not act as Lead or make delegation decisions."));
+  assert.ok(VISUAL_REVIEWER_ROLE_PROMPT.includes("If visual evidence is missing, stale, incomplete, ambiguous, or insufficient for the delegated review, say that clearly and treat it as a risk or blocker."));
 }
 
 function smokeScribeRolePromptContract(): void {
@@ -353,6 +382,7 @@ async function smokeBoardLeadDelegatesToReviewerWithRolePrompt(): Promise<void> 
       }
       if (member.name === "Reviewer") {
         assert.ok(prompt.includes(REVIEWER_ROLE_PROMPT));
+        assert.equal(prompt.includes(VISUAL_REVIEWER_ROLE_PROMPT), false);
         assert.ok(prompt.includes("Stay read-only unless the delegated task explicitly says to modify files."));
         return {
           status: "idle",
@@ -389,6 +419,144 @@ async function smokeBoardLeadDelegatesToReviewerWithRolePrompt(): Promise<void> 
   assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
   assert.ok(prompts.some((prompt) => prompt.includes(REVIEWER_ROLE_PROMPT)));
   assert.ok(prompts.some((prompt) => prompt.includes("Do not perform implementation as Coder.")));
+}
+
+async function smokeBoardLeadDelegatesToVisualReviewerWithRolePrompt(): Promise<void> {
+  resetQueue();
+  const team = makeVisualReviewerTeam("team_board_visual_reviewer_delegate", "board-visual-reviewer-model");
+  installTeams(team);
+  const created = createTeamBoardItem({
+    teamId: team.id,
+    title: "10J Visual Reviewer role delegation smoke",
+    description: "Ask Visual Reviewer to inspect screenshot evidence without editing files.",
+    assignedMembers: ["Visual Reviewer"],
+    priority: 95,
+    createdBy: "smoke",
+  }, { statePath });
+  const prompts: string[] = [];
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async ({ member, prompt }) => {
+      prompts.push(prompt);
+      if (member.name === "Lead" && prompt.includes("Board title: 10J Visual Reviewer role delegation smoke")) {
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_DELEGATE>",
+            "[{\"to\":\"Visual Reviewer\",\"task\":\"Review the available screenshot evidence for layout, readability, clipping, contrast, and missing visual states. Do not edit files.\",\"expected_summary\":\"Visual Reviewer reports visual findings, risks, missing evidence, and recommendation.\"}]",
+            "</OV_DELEGATE>",
+          ].join("\n"),
+        };
+      }
+      if (member.name === "Visual Reviewer") {
+        assert.ok(prompt.includes(VISUAL_REVIEWER_ROLE_PROMPT));
+        assert.equal(prompt.includes(REVIEWER_ROLE_PROMPT), false);
+        assert.ok(prompt.includes("Do not claim visual validation passed unless screenshots, rendered UI output, image artifacts, or equivalent visual evidence were actually inspected."));
+        assert.ok(prompt.includes("Check accessibility, readability, layout stability, spacing, alignment, responsive fit, contrast, visible state coverage, and content accuracy against the available visual evidence."));
+        assert.ok(prompt.includes("No-code-implementation rule: do not implement code as Coder."));
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_RESULT>",
+            "status: completed",
+            "summary: available screenshot evidence was inspected; no file edits were made.",
+            "files_changed: none",
+            "tests_run: not run; visual review only.",
+            "risks: fresh visual evidence would be needed before claiming broader visual validation.",
+            "recommended_next_step: Lead can report visual review findings with the evidence limitation.",
+            "</OV_RESULT>",
+          ].join("\n"),
+        };
+      }
+      return {
+        status: "idle",
+        responseText: "<OV_FINAL>\nVisual Reviewer inspected visual evidence and reported evidence limitations.\n</OV_FINAL>",
+      };
+    },
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  const run = state.runs[created.queueRuns[0]!.id];
+  const task = state.tasks[created.queueTask.id];
+  const boardItem = getTeamBoardItem(created.boardItem.id, { statePath });
+
+  assert.deepEqual(result.dispatchedRunIds, [created.queueRuns[0]!.id]);
+  assert.equal(task?.status, "completed");
+  assert.equal(run?.status, "completed");
+  assert.equal(boardItem?.executionStatus, "completed");
+  assert.equal(boardItem?.resultSummary, "Visual Reviewer inspected visual evidence and reported evidence limitations.");
+  assert.deepEqual(boardItem?.resultRoute, ["Lead", "Visual Reviewer", "Lead"]);
+  assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes(VISUAL_REVIEWER_ROLE_PROMPT)));
+}
+
+async function smokeBoardLeadDelegatesToVisualReviewerByNameWithReviewerRole(): Promise<void> {
+  resetQueue();
+  const team = makeVisualReviewerTeam("team_board_visual_reviewer_name_delegate", "board-visual-reviewer-name-model", "reviewer");
+  installTeams(team);
+  const created = createTeamBoardItem({
+    teamId: team.id,
+    title: "10J Visual Reviewer name delegation smoke",
+    description: "Ask Visual Reviewer with a reviewer role to inspect visual evidence without editing files.",
+    assignedMembers: ["Visual Reviewer"],
+    priority: 96,
+    createdBy: "smoke",
+  }, { statePath });
+  const prompts: string[] = [];
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async ({ member, prompt }) => {
+      prompts.push(prompt);
+      if (member.name === "Lead" && prompt.includes("Board title: 10J Visual Reviewer name delegation smoke")) {
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_DELEGATE>",
+            "[{\"to\":\"Visual Reviewer\",\"task\":\"Review available rendered UI evidence for visual defects. Do not edit files.\",\"expected_summary\":\"Visual Reviewer reports visual findings and missing evidence.\"}]",
+            "</OV_DELEGATE>",
+          ].join("\n"),
+        };
+      }
+      if (member.name === "Visual Reviewer") {
+        assert.ok(prompt.includes(VISUAL_REVIEWER_ROLE_PROMPT));
+        assert.equal(prompt.includes(REVIEWER_ROLE_PROMPT), false);
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_RESULT>",
+            "status: completed",
+            "summary: visual reviewer role prompt was applied by member name.",
+            "files_changed: none",
+            "tests_run: not run; prompt composition smoke.",
+            "risks: none",
+            "recommended_next_step: Lead can finalize.",
+            "</OV_RESULT>",
+          ].join("\n"),
+        };
+      }
+      return {
+        status: "idle",
+        responseText: "<OV_FINAL>\nVisual Reviewer prompt was applied by member name.\n</OV_FINAL>",
+      };
+    },
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  const run = state.runs[created.queueRuns[0]!.id];
+  const task = state.tasks[created.queueTask.id];
+  const boardItem = getTeamBoardItem(created.boardItem.id, { statePath });
+
+  assert.deepEqual(result.dispatchedRunIds, [created.queueRuns[0]!.id]);
+  assert.equal(task?.status, "completed");
+  assert.equal(run?.status, "completed");
+  assert.equal(boardItem?.executionStatus, "completed");
+  assert.equal(boardItem?.resultSummary, "Visual Reviewer prompt was applied by member name.");
+  assert.deepEqual(boardItem?.resultRoute, ["Lead", "Visual Reviewer", "Lead"]);
+  assert.ok(prompts.some((prompt) => prompt.includes(VISUAL_REVIEWER_ROLE_PROMPT)));
 }
 
 async function smokeBoardUnstructuredLeadOutputCompletesWithFallback(): Promise<void> {
@@ -569,11 +737,14 @@ async function smokeBoardWaitingDoesNotStartProviderTimeout(): Promise<void> {
 smokeLeadRolePromptContract();
 smokeCoderRolePromptContract();
 smokeReviewerRolePromptContract();
+smokeVisualReviewerRolePromptContract();
 smokeScribeRolePromptContract();
 await smokeBoardDispatchesThroughOrchestrator();
 await smokeBoardLeadDelegatesToCoderWithRolePrompt();
 await smokeBoardLeadDelegatesToScribeWithRolePrompt();
 await smokeBoardLeadDelegatesToReviewerWithRolePrompt();
+await smokeBoardLeadDelegatesToVisualReviewerWithRolePrompt();
+await smokeBoardLeadDelegatesToVisualReviewerByNameWithReviewerRole();
 await smokeBoardUnstructuredLeadOutputCompletesWithFallback();
 await smokeBoardNoOutputFailsWithDiagnostic();
 await smokeQueuedChatUnstructuredLeadOutputStillFails();

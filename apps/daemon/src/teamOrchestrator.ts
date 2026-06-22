@@ -6,7 +6,13 @@ import {
   finishOrchestratorRun,
   startOrchestratorRun,
 } from "./orchestratorRunStore.js";
-import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT, SCRIBE_ROLE_PROMPT } from "./rolePrompts.js";
+import {
+  CODER_ROLE_PROMPT,
+  LEAD_ROLE_PROMPT,
+  REVIEWER_ROLE_PROMPT,
+  SCRIBE_ROLE_PROMPT,
+  VISUAL_REVIEWER_ROLE_PROMPT,
+} from "./rolePrompts.js";
 import { getCoordinatorMember, normalizeTeamRole } from "./teamRoles.js";
 import type { TeamConfig, TeamMember, TeamMessageOrchestration } from "./types.js";
 
@@ -113,14 +119,27 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
     case "visual":
       return "You are the visual specialist. Focus on UI quality, interaction details, and visible regressions.";
     case "visual_reviewer":
-      return "You are the visual reviewer. Review UI changes for layout, clarity, polish, and visible regressions.";
+      return VISUAL_REVIEWER_ROLE_PROMPT;
     default:
       return "";
   }
 }
 
-function getDelegatedRolePrompt(role: TeamMember["role"]): string {
-  switch (normalizeTeamRole(role)) {
+function indicatesVisualReviewer(member: TeamMember): boolean {
+  const normalizedRole = normalizeTeamRole(member.role);
+  const normalizedName = member.name.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const normalizedRawRole = member.role.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return normalizedRole === "visual_reviewer"
+    || normalizedName === "visual_reviewer"
+    || normalizedRawRole === "visual_reviewer";
+}
+
+function getDelegatedRolePrompt(member: TeamMember): string {
+  if (indicatesVisualReviewer(member)) {
+    return VISUAL_REVIEWER_ROLE_PROMPT;
+  }
+
+  switch (normalizeTeamRole(member.role)) {
     case "coder":
       return CODER_ROLE_PROMPT;
     case "reviewer":
@@ -253,7 +272,7 @@ export function buildLeadReviewPrompt(results: DelegationResult[]): string {
 }
 
 export function buildDelegatedTaskPrompt(team: TeamConfig, member: TeamMember, task: DelegationTask): string {
-  const delegatedRolePrompt = getDelegatedRolePrompt(member.role);
+  const delegatedRolePrompt = getDelegatedRolePrompt(member);
   return [
     `You are the OpenVide Team member named: ${member.name}.`,
     `Your role is: ${member.role}.`,
