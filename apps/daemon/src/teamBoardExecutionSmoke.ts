@@ -16,6 +16,7 @@ const {
   dispatchTeamQueueOnce,
 } = await import("./teamQueueDispatcher.js");
 const {
+  createTeamQueueTask,
   loadTeamQueueState,
   saveTeamQueueState,
 } = await import("./teamQueueStore.js");
@@ -110,11 +111,89 @@ async function smokeBoardDispatchesThroughOrchestrator(): Promise<void> {
   assert.equal((task?.metadata?.queuedBoardResult as { finalStatus?: string } | undefined)?.finalStatus, "completed");
   assert.equal((run?.metadata?.queuedBoardResult as { provider?: string; model?: string } | undefined)?.provider, "codex");
   assert.equal((run?.metadata?.queuedBoardResult as { provider?: string; model?: string } | undefined)?.model, "board-model");
+  assert.equal((run?.metadata?.queuedBoardResult as { missing_ov_final_fallback?: boolean } | undefined)?.missing_ov_final_fallback, undefined);
   assert.ok(prompts.some((prompt) => prompt.includes("Board title: 10J board execution smoke")));
   assert.ok(prompts.some((prompt) => prompt.includes("Assigned member intent: Coder.")));
   assert.ok(prompts.some((prompt) => prompt.includes("Priority: 91")));
+  assert.ok(prompts.some((prompt) => prompt.includes("You MUST end with an OV_FINAL block.")));
+  assert.ok(prompts.some((prompt) => prompt.includes("<OV_FINAL>\nFinal Board result summary here.\n</OV_FINAL>")));
   assert.ok(turn?.providerStartedAt);
   assert.ok(turn?.executionTimeoutStartedAt);
+}
+
+async function smokeBoardUnstructuredLeadOutputCompletesWithFallback(): Promise<void> {
+  resetQueue();
+  const team = makeTeam("team_board_fallback", "board-fallback-model");
+  installTeams(team);
+  const created = createTeamBoardItem({
+    teamId: team.id,
+    title: "10J board fallback smoke",
+    description: "Reply with exactly BOARD_FALLBACK_OK. Do not edit files.",
+    priority: 88,
+    createdBy: "smoke",
+  }, { statePath });
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async () => ({
+      status: "idle",
+      responseText: "BOARD_FALLBACK_OK",
+    }),
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  const run = state.runs[created.queueRuns[0]!.id];
+  const task = state.tasks[created.queueTask.id];
+  const boardItem = getTeamBoardItem(created.boardItem.id, { statePath });
+  const queuedBoardResult = run?.metadata?.queuedBoardResult as {
+    assistantText?: string;
+    finalStatus?: string;
+    missing_ov_final_fallback?: boolean;
+    fallbackReason?: string;
+    originalParserError?: string;
+    diagnostics?: string;
+    provider?: string;
+    model?: string;
+  } | undefined;
+  const taskBoardResult = task?.metadata?.queuedBoardResult as {
+    assistantText?: string;
+    missing_ov_final_fallback?: boolean;
+    fallbackReason?: string;
+    originalParserError?: string;
+  } | undefined;
+  const boardMetadata = task?.metadata?.board as {
+    resultSummary?: string;
+    resultStatus?: string;
+    resultDiagnostics?: string;
+    missing_ov_final_fallback?: boolean;
+    fallbackReason?: string;
+    originalParserError?: string;
+  } | undefined;
+
+  assert.deepEqual(result.dispatchedRunIds, [created.queueRuns[0]!.id]);
+  assert.equal(result.failedRunIds.includes(created.queueRuns[0]!.id), false);
+  assert.equal(task?.status, "completed");
+  assert.equal(run?.status, "completed");
+  assert.equal(boardItem?.executionStatus, "completed");
+  assert.equal(boardItem?.resultSummary, "BOARD_FALLBACK_OK");
+  assert.equal(boardItem?.resultStatus, "completed");
+  assert.equal(boardItem?.resultDiagnostics, "Board completed from unstructured Lead output after missing OV_FINAL/OV_DELEGATE.");
+  assert.equal(queuedBoardResult?.assistantText, "BOARD_FALLBACK_OK");
+  assert.equal(queuedBoardResult?.finalStatus, "completed");
+  assert.equal(queuedBoardResult?.provider, "codex");
+  assert.equal(queuedBoardResult?.model, "board-fallback-model");
+  assert.equal(queuedBoardResult?.missing_ov_final_fallback, true);
+  assert.equal(queuedBoardResult?.fallbackReason, "board_unstructured_final");
+  assert.equal(queuedBoardResult?.originalParserError, "Lead did not emit OV_FINAL or OV_DELEGATE.");
+  assert.equal(taskBoardResult?.assistantText, "BOARD_FALLBACK_OK");
+  assert.equal(taskBoardResult?.missing_ov_final_fallback, true);
+  assert.equal(taskBoardResult?.fallbackReason, "board_unstructured_final");
+  assert.equal(taskBoardResult?.originalParserError, "Lead did not emit OV_FINAL or OV_DELEGATE.");
+  assert.equal(boardMetadata?.resultSummary, "BOARD_FALLBACK_OK");
+  assert.equal(boardMetadata?.missing_ov_final_fallback, true);
+  assert.equal(boardMetadata?.fallbackReason, "board_unstructured_final");
+  assert.equal(boardMetadata?.originalParserError, "Lead did not emit OV_FINAL or OV_DELEGATE.");
 }
 
 async function smokeBoardNoOutputFailsWithDiagnostic(): Promise<void> {
@@ -147,6 +226,45 @@ async function smokeBoardNoOutputFailsWithDiagnostic(): Promise<void> {
   assert.equal(boardItem?.executionStatus, "blocked");
   assert.match(run?.error ?? "", /Lead did not emit|without assistant output/);
   assert.equal((task?.metadata?.queuedBoardResult as { finalStatus?: string } | undefined)?.finalStatus, "blocked");
+  assert.equal((task?.metadata?.queuedBoardResult as { missing_ov_final_fallback?: boolean } | undefined)?.missing_ov_final_fallback, undefined);
+}
+
+async function smokeQueuedChatUnstructuredLeadOutputStillFails(): Promise<void> {
+  resetQueue();
+  const team = makeTeam("team_chat_strict", "chat-strict-model");
+  installTeams(team);
+  const created = createTeamQueueTask({
+    teamId: team.id,
+    source: "chat",
+    title: "Queued Chat strict parser smoke",
+    description: "Reply with exactly CHAT_RAW_OK.",
+    metadata: {
+      from: "user",
+      to: "*",
+      clientMessageId: "chat_strict_smoke",
+    },
+  }, { statePath });
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async () => ({
+      status: "idle",
+      responseText: "CHAT_RAW_OK",
+    }),
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  const run = state.runs[created.run.id];
+  const task = state.tasks[created.task.id];
+
+  assert.ok(result.failedRunIds.includes(created.run.id));
+  assert.equal(task?.status, "failed");
+  assert.equal(run?.status, "failed");
+  assert.equal(run?.metadata?.assistantText, "CHAT_RAW_OK");
+  assert.equal(run?.metadata?.finalStatus, "blocked");
+  assert.equal(run?.metadata?.fallbackReason, undefined);
+  assert.equal((run?.metadata?.queuedBoardResult as { fallbackReason?: string } | undefined)?.fallbackReason, undefined);
 }
 
 async function smokeBoardWaitingDoesNotStartProviderTimeout(): Promise<void> {
@@ -179,7 +297,9 @@ async function smokeBoardWaitingDoesNotStartProviderTimeout(): Promise<void> {
 }
 
 await smokeBoardDispatchesThroughOrchestrator();
+await smokeBoardUnstructuredLeadOutputCompletesWithFallback();
 await smokeBoardNoOutputFailsWithDiagnostic();
+await smokeQueuedChatUnstructuredLeadOutputStillFails();
 await smokeBoardWaitingDoesNotStartProviderTimeout();
 
 const finalState = loadTeamQueueState({ statePath, recoverStaleActive: false });

@@ -30,6 +30,7 @@ const DISPATCHABLE_RUN_STATUSES = new Set(["queued", "waiting_for_team_slot", "w
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
 const TERMINAL_TURN_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted", "skipped"]);
+const BOARD_MISSING_OV_FINAL_ERROR = "Lead did not emit OV_FINAL or OV_DELEGATE.";
 
 function isDeletedRecord(record: { deletedAt?: string; visibility?: string }): boolean {
   return Boolean(record.deletedAt) || record.visibility === "deleted";
@@ -335,6 +336,10 @@ function queuedChatFailureSummary(result: tm.QueuedTeamChatResult | undefined): 
   return undefined;
 }
 
+function containsOvDecisionBlock(text: string | undefined): boolean {
+  return /<\s*OV_FINAL\b/i.test(text ?? "") || /<\s*OV_DELEGATE\b/i.test(text ?? "");
+}
+
 function persistQueuedChatResult(
   ctx: DispatchContext,
   task: TeamQueueTask,
@@ -440,7 +445,33 @@ function buildBoardExecutionPrompt(task: TeamQueueTask, run: TeamQueueRun, team:
     roster || "- none",
     "",
     "Return a concise final response that summarizes the real work performed or clearly explains any failure, blocker, or no-output condition.",
+    "You MUST end with an OV_FINAL block.",
+    "",
+    "Exact final block format:",
+    "<OV_FINAL>",
+    "Final Board result summary here.",
+    "</OV_FINAL>",
   ].join("\n");
+}
+
+function boardUnstructuredFinalFallback(result: tm.QueuedTeamChatResult | undefined): {
+  assistantText: string;
+  diagnostics: string;
+} | undefined {
+  const assistantText = trimResultText(result?.assistant?.text);
+  if (!assistantText) return undefined;
+  if (assistantText === BOARD_MISSING_OV_FINAL_ERROR) return undefined;
+  if (containsOvDecisionBlock(assistantText)) return undefined;
+  if (result?.assistant?.orchestration?.status !== "blocked") return undefined;
+
+  const timeline = result.assistant.orchestration.timeline ?? [];
+  const failedProviderEvent = timeline.some((entry) => entry.status === "failed");
+  if (failedProviderEvent) return undefined;
+
+  return {
+    assistantText,
+    diagnostics: BOARD_MISSING_OV_FINAL_ERROR,
+  };
 }
 
 function persistQueuedBoardResult(
@@ -453,17 +484,22 @@ function persistQueuedBoardResult(
   const orchestration = assistant?.orchestration;
   const assistantText = trimResultText(assistant?.text);
   const route = orchestration?.route ?? [];
-  const finalStatus = orchestration?.status ?? (assistantText ? "completed" : "failed");
+  const fallback = task.source === "board" ? boardUnstructuredFinalFallback(result) : undefined;
+  const finalStatus = fallback ? "completed" : orchestration?.status ?? (assistantText ? "completed" : "failed");
   const latestTimelineEntry = orchestration?.timeline?.slice().reverse().find((entry) => entry.memberName || entry.tool || entry.model);
-  const diagnostic = queuedChatFailureSummary(result);
+  const diagnostic = fallback ? undefined : queuedChatFailureSummary(result);
   const boardExecutionStatus = finalStatus === "blocked" ? "blocked" : undefined;
+  const resultText = fallback?.assistantText ?? assistantText;
+  const resultDiagnostics = fallback
+    ? "Board completed from unstructured Lead output after missing OV_FINAL/OV_DELEGATE."
+    : diagnostic ?? latestTimelineEntry?.diagnostics;
 
   updateTeamQueueState((state) => {
     const currentRun = state.runs[run.id];
     const currentTask = state.tasks[task.id];
     const timestamp = nowISO();
     const resultMetadata = {
-      assistantText,
+      assistantText: resultText,
       route,
       routeSummary: orchestration?.routeSummary,
       provider: latestTimelineEntry?.tool,
@@ -471,20 +507,26 @@ function persistQueuedBoardResult(
       memberName: assistant?.from ?? latestTimelineEntry?.memberName,
       finalStatus,
       orchestrationRunId: orchestration?.runId,
-      diagnostics: diagnostic ?? latestTimelineEntry?.diagnostics,
+      diagnostics: resultDiagnostics,
+      missing_ov_final_fallback: fallback ? true : undefined,
+      fallbackReason: fallback ? "board_unstructured_final" : undefined,
+      originalParserError: fallback ? fallback.diagnostics : undefined,
     };
     if (currentRun && !isDeletedRecord(currentRun)) {
       currentRun.route = route.length > 0 ? route : currentRun.route;
       currentRun.metadata = {
         ...(currentRun.metadata ?? {}),
         queuedBoardResult: resultMetadata,
-        assistantText,
+        assistantText: resultText,
         route,
         provider: resultMetadata.provider,
         model: resultMetadata.model,
         memberName: resultMetadata.memberName,
         finalStatus,
         orchestration,
+        missing_ov_final_fallback: fallback ? true : undefined,
+        fallbackReason: fallback ? "board_unstructured_final" : undefined,
+        originalParserError: fallback ? fallback.diagnostics : undefined,
         noOutputDiagnostic: assistantText ? undefined : diagnostic,
       };
       currentRun.error = finalStatus === "failed" || !assistantText ? diagnostic : currentRun.error;
@@ -495,31 +537,37 @@ function persistQueuedBoardResult(
       currentTask.metadata = {
         ...(currentTask.metadata ?? {}),
         queuedBoardResult: resultMetadata,
-        assistantText,
+        assistantText: resultText,
         route,
         provider: resultMetadata.provider,
         model: resultMetadata.model,
         memberName: resultMetadata.memberName,
         finalStatus,
         orchestration,
+        missing_ov_final_fallback: fallback ? true : undefined,
+        fallbackReason: fallback ? "board_unstructured_final" : undefined,
+        originalParserError: fallback ? fallback.diagnostics : undefined,
         noOutputDiagnostic: assistantText ? undefined : diagnostic,
         board: {
           ...existingBoard,
           executionStatus: boardExecutionStatus ?? existingBoard.executionStatus,
-          resultSummary: assistantText,
+          resultSummary: resultText,
           resultStatus: finalStatus,
           resultRoute: route,
           resultMemberName: resultMetadata.memberName,
           resultProvider: resultMetadata.provider,
           resultModel: resultMetadata.model,
-          resultDiagnostics: resultMetadata.diagnostics,
+          resultDiagnostics: resultDiagnostics,
+          missing_ov_final_fallback: fallback ? true : undefined,
+          fallbackReason: fallback ? "board_unstructured_final" : undefined,
+          originalParserError: fallback ? fallback.diagnostics : undefined,
         },
       };
       currentTask.updatedAt = timestamp;
     }
   }, activeOptions(ctx.options));
 
-  return { diagnostic, finalStatus, assistantText };
+  return { diagnostic, finalStatus, assistantText: resultText };
 }
 
 async function defaultExecuteMember(input: QueuedMemberExecutorInput): Promise<tm.TeamMemberTurnCompletion> {
