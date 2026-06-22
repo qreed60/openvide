@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT } from "./rolePrompts.js";
+import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT } from "./rolePrompts.js";
 import type { TeamConfig } from "./types.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openvide-team-board-execution-"));
@@ -61,6 +61,18 @@ function makeTeam(id: string, model: string): TeamConfig {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+function makeReviewerTeam(id: string, model: string): TeamConfig {
+  const team = makeTeam(id, model);
+  team.members.push({
+    name: "Reviewer",
+    tool: "codex",
+    model,
+    role: "reviewer",
+    sessionId: `session_${id}_reviewer`,
+  });
+  return team;
 }
 
 function installTeams(...teams: TeamConfig[]): void {
@@ -141,6 +153,15 @@ function smokeCoderRolePromptContract(): void {
   assert.ok(CODER_ROLE_PROMPT.includes("Do not perform review, approval, QA sign-off, or final sign-off as Reviewer."));
 }
 
+function smokeReviewerRolePromptContract(): void {
+  assert.ok(REVIEWER_ROLE_PROMPT.includes("You are Reviewer."));
+  assert.ok(REVIEWER_ROLE_PROMPT.includes("Stay read-only unless the delegated task explicitly says to modify files."));
+  assert.ok(REVIEWER_ROLE_PROMPT.includes("Do not claim validation passed unless validation output is present."));
+  assert.ok(REVIEWER_ROLE_PROMPT.includes("Do not perform implementation as Coder."));
+  assert.ok(REVIEWER_ROLE_PROMPT.includes("Do not act as Lead; return Reviewer findings and recommendation to Lead."));
+  assert.ok(REVIEWER_ROLE_PROMPT.includes("If blocked by missing context, missing diffs, missing queue/run metadata, or missing validation output"));
+}
+
 async function smokeBoardLeadDelegatesToCoderWithRolePrompt(): Promise<void> {
   resetQueue();
   const team = makeTeam("team_board_coder_delegate", "board-coder-model");
@@ -207,6 +228,75 @@ async function smokeBoardLeadDelegatesToCoderWithRolePrompt(): Promise<void> {
   assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
   assert.ok(prompts.some((prompt) => prompt.includes(CODER_ROLE_PROMPT)));
   assert.ok(prompts.some((prompt) => prompt.includes("Do not perform review, approval, QA sign-off, or final sign-off as Reviewer.")));
+}
+
+async function smokeBoardLeadDelegatesToReviewerWithRolePrompt(): Promise<void> {
+  resetQueue();
+  const team = makeReviewerTeam("team_board_reviewer_delegate", "board-reviewer-model");
+  installTeams(team);
+  const created = createTeamBoardItem({
+    teamId: team.id,
+    title: "10J Reviewer role delegation smoke",
+    description: "Ask Reviewer to inspect claimed validation evidence without editing files.",
+    assignedMembers: ["Reviewer"],
+    priority: 93,
+    createdBy: "smoke",
+  }, { statePath });
+  const prompts: string[] = [];
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async ({ member, prompt }) => {
+      prompts.push(prompt);
+      if (member.name === "Lead" && prompt.includes("Board title: 10J Reviewer role delegation smoke")) {
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_DELEGATE>",
+            "[{\"to\":\"Reviewer\",\"task\":\"Review the delegated Board task and verify whether validation evidence is present. Do not edit files.\",\"expected_summary\":\"Reviewer reports findings, risks, validation evidence, and recommendation.\"}]",
+            "</OV_DELEGATE>",
+          ].join("\n"),
+        };
+      }
+      if (member.name === "Reviewer") {
+        assert.ok(prompt.includes(REVIEWER_ROLE_PROMPT));
+        assert.ok(prompt.includes("Stay read-only unless the delegated task explicitly says to modify files."));
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_RESULT>",
+            "status: completed",
+            "summary: no validation output was present, so validation cannot be confirmed.",
+            "files_changed: none",
+            "tests_run: not run; review-only delegation and no validation output was provided.",
+            "risks: claimed validation would be unsupported without output.",
+            "recommended_next_step: Lead should report validation as missing evidence.",
+            "</OV_RESULT>",
+          ].join("\n"),
+        };
+      }
+      return {
+        status: "idle",
+        responseText: "<OV_FINAL>\nReviewer found missing validation evidence and no file edits were made.\n</OV_FINAL>",
+      };
+    },
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  const run = state.runs[created.queueRuns[0]!.id];
+  const task = state.tasks[created.queueTask.id];
+  const boardItem = getTeamBoardItem(created.boardItem.id, { statePath });
+
+  assert.deepEqual(result.dispatchedRunIds, [created.queueRuns[0]!.id]);
+  assert.equal(task?.status, "completed");
+  assert.equal(run?.status, "completed");
+  assert.equal(boardItem?.executionStatus, "completed");
+  assert.equal(boardItem?.resultSummary, "Reviewer found missing validation evidence and no file edits were made.");
+  assert.deepEqual(boardItem?.resultRoute, ["Lead", "Reviewer", "Lead"]);
+  assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes(REVIEWER_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes("Do not perform implementation as Coder.")));
 }
 
 async function smokeBoardUnstructuredLeadOutputCompletesWithFallback(): Promise<void> {
@@ -386,8 +476,10 @@ async function smokeBoardWaitingDoesNotStartProviderTimeout(): Promise<void> {
 
 smokeLeadRolePromptContract();
 smokeCoderRolePromptContract();
+smokeReviewerRolePromptContract();
 await smokeBoardDispatchesThroughOrchestrator();
 await smokeBoardLeadDelegatesToCoderWithRolePrompt();
+await smokeBoardLeadDelegatesToReviewerWithRolePrompt();
 await smokeBoardUnstructuredLeadOutputCompletesWithFallback();
 await smokeBoardNoOutputFailsWithDiagnostic();
 await smokeQueuedChatUnstructuredLeadOutputStillFails();

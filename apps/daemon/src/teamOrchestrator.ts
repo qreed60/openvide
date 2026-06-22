@@ -6,7 +6,7 @@ import {
   finishOrchestratorRun,
   startOrchestratorRun,
 } from "./orchestratorRunStore.js";
-import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT } from "./rolePrompts.js";
+import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT } from "./rolePrompts.js";
 import { getCoordinatorMember, normalizeTeamRole } from "./teamRoles.js";
 import type { TeamConfig, TeamMember, TeamMessageOrchestration } from "./types.js";
 
@@ -102,7 +102,7 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
     case "coder":
       return CODER_ROLE_PROMPT;
     case "reviewer":
-      return "You are the reviewer/validator. Review, verify, and report concrete issues or risks.";
+      return REVIEWER_ROLE_PROMPT;
     case "planner":
       return "You are the planner. Coordinate work and delegate bounded tasks through OV_DELEGATE.";
     case "lead":
@@ -121,7 +121,14 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
 }
 
 function getDelegatedRolePrompt(role: TeamMember["role"]): string {
-  return normalizeTeamRole(role) === "coder" ? CODER_ROLE_PROMPT : "";
+  switch (normalizeTeamRole(role)) {
+    case "coder":
+      return CODER_ROLE_PROMPT;
+    case "reviewer":
+      return REVIEWER_ROLE_PROMPT;
+    default:
+      return "";
+  }
 }
 
 function extractTaggedBlock(text: string, tag: string): string | null {
