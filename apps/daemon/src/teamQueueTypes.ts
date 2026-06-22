@@ -203,6 +203,13 @@ export interface TeamBoardItem {
   teamId: string;
   title: string;
   description?: string;
+  resultSummary?: string;
+  resultStatus?: string;
+  resultRoute?: string[];
+  resultMemberName?: string;
+  resultProvider?: TeamTool;
+  resultModel?: string;
+  resultDiagnostics?: string;
   source: "board";
   executionStatus: TeamBoardExecutionStatus;
   reviewStatus: TeamBoardReviewStatus;
@@ -271,6 +278,7 @@ export interface TeamQueueStatusItem {
   teamId: string;
   source?: TeamQueueTaskSource;
   title?: string;
+  description?: string;
   status: TeamQueueRunStatus;
   taskStatus?: TeamQueueTaskStatus;
   priority: number;
@@ -282,6 +290,9 @@ export interface TeamQueueStatusItem {
   finishedAt?: string;
   reorderable: boolean;
   reorderBlockedReason?: string;
+  runIds?: string[];
+  sourceRef?: TeamQueueTask["sourceRef"];
+  metadata?: Record<string, unknown>;
 }
 
 export interface CreateTeamQueueTaskInput {

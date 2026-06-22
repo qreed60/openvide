@@ -9,6 +9,9 @@ process.env.HOME = tmpDir;
 
 const sm = await import("./sessionManager.js");
 const {
+  createTeamBoardItem,
+} = await import("./teamBoardStore.js");
+const {
   createTeamQueueTask,
   deleteTeamQueueItem,
   loadTeamQueueState,
@@ -95,6 +98,28 @@ async function smokeWorkerDispatchesChat(): Promise<void> {
   assert.equal(status.lastDispatchResult?.dispatchedRunIds[0], queued.run.id);
   assert.equal(state.runs[queued.run.id]?.status, "completed");
   assert.ok(status.lastTickAt);
+}
+
+async function smokeWorkerDispatchesBoard(): Promise<void> {
+  resetQueue();
+  const team = makeTeam("team_worker_board_dispatch", "worker-board-model");
+  installTeams(team);
+  const queued = createTeamBoardItem({
+    teamId: team.id,
+    title: "Auto dispatch Board task",
+    description: "Reply with worker board done.",
+  }, { statePath });
+  const calls = { count: 0 };
+  configureQueueWorker({ enabled: true });
+
+  const status = await tickQueueWorkerOnce(await workerOptions(calls));
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+
+  assert.equal(calls.count, 1);
+  assert.equal(status.lastDispatchResult?.dispatchedRunIds[0], queued.queueRuns[0]?.id);
+  assert.equal(state.runs[queued.queueRuns[0]!.id]?.status, "completed");
+  assert.equal(state.tasks[queued.queueTask.id]?.status, "completed");
+  assert.equal(state.tasks[queued.queueTask.id]?.metadata?.assistantText, "worker done");
 }
 
 async function smokeDisabledWorkerDoesNotDispatch(): Promise<void> {
@@ -204,6 +229,7 @@ async function smokeManualDispatchStillWorks(): Promise<void> {
 }
 
 await smokeWorkerDispatchesChat();
+await smokeWorkerDispatchesBoard();
 await smokeDisabledWorkerDoesNotDispatch();
 await smokeWorkerSkipsDeletedCancelledDraftBlocked();
 await smokeWorkerRespectsTeamAndResourceSlots();

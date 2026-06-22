@@ -758,6 +758,7 @@ export function summarizeTeamQueueState(
         teamId: run.teamId,
         source: task?.source,
         title: task?.title,
+        description: task?.description,
         status: run.status,
         taskStatus: task?.status,
         priority: queuePriority(task, run),
@@ -769,6 +770,12 @@ export function summarizeTeamQueueState(
         finishedAt: run.finishedAt ?? task?.finishedAt,
         reorderable: !reorderBlockedReason,
         reorderBlockedReason,
+        runIds: task?.runIds,
+        sourceRef: task?.sourceRef,
+        metadata: {
+          ...(task?.metadata ?? {}),
+          runMetadata: run.metadata,
+        },
       };
     }),
     tasks: {

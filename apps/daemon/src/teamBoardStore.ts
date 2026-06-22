@@ -31,6 +31,13 @@ interface BoardMetadata {
   reviewFeedback?: string;
   blockedReason?: string;
   executionStatus?: TeamBoardExecutionStatus;
+  resultSummary?: string;
+  resultStatus?: string;
+  resultRoute?: string[];
+  resultMemberName?: string;
+  resultProvider?: TeamBoardItem["resultProvider"];
+  resultModel?: string;
+  resultDiagnostics?: string;
 }
 
 export interface SetTeamBoardReviewStatusInput {
@@ -113,12 +120,12 @@ function deriveExecutionStatus(
   run: TeamQueueRun | undefined,
   metadata: BoardMetadata,
 ): TeamBoardExecutionStatus {
+  if (metadata.executionStatus === "blocked") return "blocked";
   const runStatus = runExecutionStatus(run);
   const taskStatus = taskExecutionStatus(task);
   if (isTerminalExecutionStatus(runStatus)) return runStatus!;
   if (isTerminalExecutionStatus(taskStatus)) return taskStatus;
   if (metadata.executionStatus === "draft") return "draft";
-  if (metadata.executionStatus === "blocked") return "blocked";
   return runStatus ?? taskStatus;
 }
 
@@ -142,6 +149,13 @@ function toBoardItem(task: TeamQueueTask, runsById: Record<string, TeamQueueRun>
     teamId: task.teamId,
     title: task.title,
     description: task.description,
+    resultSummary: cleanString(metadata.resultSummary),
+    resultStatus: cleanString(metadata.resultStatus),
+    resultRoute: cleanMembers(metadata.resultRoute),
+    resultMemberName: cleanString(metadata.resultMemberName),
+    resultProvider: metadata.resultProvider,
+    resultModel: cleanString(metadata.resultModel),
+    resultDiagnostics: cleanString(metadata.resultDiagnostics),
     source: "board",
     executionStatus,
     reviewStatus: reviewStatusValue(metadata.reviewStatus),

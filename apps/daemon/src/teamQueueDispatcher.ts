@@ -256,11 +256,14 @@ function resolveFirstMember(
     return { team, reason: "Plan queue dispatch is waiting for a scheduler-safe plan-generation adapter" };
   }
 
-  if (task.source === "board" || task.source === "manual") {
-    if (run.route.length === 0) {
-      return { team, reason: "Board/manual queue dispatch is waiting for an assigned member route" };
-    }
-    return { team, reason: "Board/manual queue dispatch is waiting for a scheduler-safe board task adapter" };
+  if (task.source === "board") {
+    const member = getCoordinatorMember(team);
+    if (!member) return { team, reason: `Team ${run.teamId} has no coordinator member` };
+    return { team, member, resourceKey: modelResourceKey(member.tool, member.model) };
+  }
+
+  if (task.source === "manual") {
+    return { team, reason: "Manual queue dispatch is waiting for a scheduler-safe task adapter" };
   }
 
   return { team, reason: `Queue source ${task.source} has no dispatcher adapter yet` };
@@ -396,6 +399,127 @@ function persistQueuedChatResult(
   }, activeOptions(ctx.options));
 
   return diagnostic;
+}
+
+function boardMetadata(task: TeamQueueTask): Record<string, unknown> {
+  const raw = task.metadata?.board;
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((entry) => typeof entry === "string" ? entry.trim() : "").filter(Boolean)
+    : [];
+}
+
+function buildBoardExecutionPrompt(task: TeamQueueTask, run: TeamQueueRun, team: TeamConfig): string {
+  const board = boardMetadata(task);
+  const assignedMembers = stringArray(board.assignedMembers).length > 0
+    ? stringArray(board.assignedMembers)
+    : run.route;
+  const roster = team.members
+    .map((member) => `- ${member.name} (${member.role}, ${member.tool}${member.model ? `, ${member.model}` : ""})`)
+    .join("\n");
+  const assignmentIntent = assignedMembers.length > 0
+    ? [
+      `Assigned member intent: ${assignedMembers.join(", ")}.`,
+      "Use these assignments when deciding who should execute or contribute. If coordination is needed, the Lead should delegate to the assigned member(s) through the team orchestrator.",
+    ].join("\n")
+    : "Assigned member intent: none. The Lead should decide and may run the task directly if that is the best path.";
+  return [
+    "Execute this queue-backed Board task through Team Chat orchestration.",
+    "",
+    `Board title: ${task.title}`,
+    task.description ? `Board description:\n${task.description}` : "Board description: none.",
+    `Priority: ${task.priority ?? run.priority ?? "unspecified"}`,
+    assignmentIntent,
+    "",
+    `Team: ${team.name} (${team.id})`,
+    `Working directory: ${team.workingDirectory}`,
+    "Team roster:",
+    roster || "- none",
+    "",
+    "Return a concise final response that summarizes the real work performed or clearly explains any failure, blocker, or no-output condition.",
+  ].join("\n");
+}
+
+function persistQueuedBoardResult(
+  ctx: DispatchContext,
+  task: TeamQueueTask,
+  run: TeamQueueRun,
+  result: tm.QueuedTeamChatResult | undefined,
+): { diagnostic?: string; finalStatus: string; assistantText?: string } {
+  const assistant = result?.assistant;
+  const orchestration = assistant?.orchestration;
+  const assistantText = trimResultText(assistant?.text);
+  const route = orchestration?.route ?? [];
+  const finalStatus = orchestration?.status ?? (assistantText ? "completed" : "failed");
+  const latestTimelineEntry = orchestration?.timeline?.slice().reverse().find((entry) => entry.memberName || entry.tool || entry.model);
+  const diagnostic = queuedChatFailureSummary(result);
+  const boardExecutionStatus = finalStatus === "blocked" ? "blocked" : undefined;
+
+  updateTeamQueueState((state) => {
+    const currentRun = state.runs[run.id];
+    const currentTask = state.tasks[task.id];
+    const timestamp = nowISO();
+    const resultMetadata = {
+      assistantText,
+      route,
+      routeSummary: orchestration?.routeSummary,
+      provider: latestTimelineEntry?.tool,
+      model: latestTimelineEntry?.model,
+      memberName: assistant?.from ?? latestTimelineEntry?.memberName,
+      finalStatus,
+      orchestrationRunId: orchestration?.runId,
+      diagnostics: diagnostic ?? latestTimelineEntry?.diagnostics,
+    };
+    if (currentRun && !isDeletedRecord(currentRun)) {
+      currentRun.route = route.length > 0 ? route : currentRun.route;
+      currentRun.metadata = {
+        ...(currentRun.metadata ?? {}),
+        queuedBoardResult: resultMetadata,
+        assistantText,
+        route,
+        provider: resultMetadata.provider,
+        model: resultMetadata.model,
+        memberName: resultMetadata.memberName,
+        finalStatus,
+        orchestration,
+        noOutputDiagnostic: assistantText ? undefined : diagnostic,
+      };
+      currentRun.error = finalStatus === "failed" || !assistantText ? diagnostic : currentRun.error;
+      currentRun.updatedAt = timestamp;
+    }
+    if (currentTask && !isDeletedRecord(currentTask)) {
+      const existingBoard = boardMetadata(currentTask);
+      currentTask.metadata = {
+        ...(currentTask.metadata ?? {}),
+        queuedBoardResult: resultMetadata,
+        assistantText,
+        route,
+        provider: resultMetadata.provider,
+        model: resultMetadata.model,
+        memberName: resultMetadata.memberName,
+        finalStatus,
+        orchestration,
+        noOutputDiagnostic: assistantText ? undefined : diagnostic,
+        board: {
+          ...existingBoard,
+          executionStatus: boardExecutionStatus ?? existingBoard.executionStatus,
+          resultSummary: assistantText,
+          resultStatus: finalStatus,
+          resultRoute: route,
+          resultMemberName: resultMetadata.memberName,
+          resultProvider: resultMetadata.provider,
+          resultModel: resultMetadata.model,
+          resultDiagnostics: resultMetadata.diagnostics,
+        },
+      };
+      currentTask.updatedAt = timestamp;
+    }
+  }, activeOptions(ctx.options));
+
+  return { diagnostic, finalStatus, assistantText };
 }
 
 async function defaultExecuteMember(input: QueuedMemberExecutorInput): Promise<tm.TeamMemberTurnCompletion> {
@@ -604,6 +728,25 @@ async function executeChatRun(
   });
 }
 
+async function executeBoardRun(
+  ctx: DispatchContext,
+  task: TeamQueueTask,
+  run: TeamQueueRun,
+  team: TeamConfig,
+): Promise<tm.QueuedTeamChatResult> {
+  return tm.runQueuedTeamChat({
+    teamId: run.teamId,
+    from: "user",
+    to: "*",
+    text: buildBoardExecutionPrompt(task, run, team),
+    persistMessages: ctx.options?.persistChatMessages,
+    queueTaskId: task.id,
+    queueRunId: run.id,
+    queueRunIds: task.runIds,
+    invokeMember: (member, prompt) => executeQueuedMemberTurn(ctx, task, run, team, member, prompt),
+  });
+}
+
 async function executeRun(
   ctx: DispatchContext,
   task: TeamQueueTask,
@@ -612,18 +755,30 @@ async function executeRun(
 ): Promise<"completed" | "waiting" | "failed"> {
   markRunStarted(ctx, task, run);
   try {
-    if (task.source !== "chat") {
+    if (task.source === "chat") {
+      const result = await executeChatRun(ctx, task, run, team);
+      const diagnostic = persistQueuedChatResult(ctx, task, run, result);
+      const finalStatus = result.assistant?.orchestration?.status;
+      if (diagnostic || finalStatus === "failed" || finalStatus === "blocked") {
+        markRunFinished(ctx, run, "failed", diagnostic ?? trimResultText(result.assistant?.text) ?? `Queued chat dispatch ended with status ${finalStatus}.`);
+        return "failed";
+      }
+      markRunFinished(ctx, run, "completed", "Queued chat dispatch completed.");
+      return "completed";
+    }
+    if (task.source === "board") {
+      const result = await executeBoardRun(ctx, task, run, team);
+      const { diagnostic, finalStatus, assistantText } = persistQueuedBoardResult(ctx, task, run, result);
+      if (diagnostic || finalStatus === "failed" || finalStatus === "blocked") {
+        markRunFinished(ctx, run, "failed", diagnostic ?? assistantText ?? `Queued Board dispatch ended with status ${finalStatus}.`);
+        return "failed";
+      }
+      markRunFinished(ctx, run, "completed", "Queued Board dispatch completed.");
+      return "completed";
+    }
+    {
       throw new Error(`No executable dispatcher adapter for ${task.source}`);
     }
-    const result = await executeChatRun(ctx, task, run, team);
-    const diagnostic = persistQueuedChatResult(ctx, task, run, result);
-    const finalStatus = result.assistant?.orchestration?.status;
-    if (diagnostic || finalStatus === "failed" || finalStatus === "blocked") {
-      markRunFinished(ctx, run, "failed", diagnostic ?? trimResultText(result.assistant?.text) ?? `Queued chat dispatch ended with status ${finalStatus}.`);
-      return "failed";
-    }
-    markRunFinished(ctx, run, "completed", "Queued chat dispatch completed.");
-    return "completed";
   } catch (err) {
     if (err instanceof TeamQueueDispatchPause) {
       return "waiting";
