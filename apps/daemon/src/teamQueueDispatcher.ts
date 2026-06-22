@@ -4,6 +4,7 @@ import {
   modelResourceKey,
   releaseResource,
 } from "./modelResourceScheduler.js";
+import { LEAD_ROLE_PROMPT } from "./rolePrompts.js";
 import {
   getTeamQueueStatePath,
   getTeamQueueStatus,
@@ -432,6 +433,9 @@ function buildBoardExecutionPrompt(task: TeamQueueTask, run: TeamQueueRun, team:
     ].join("\n")
     : "Assigned member intent: none. The Lead should decide and may run the task directly if that is the best path.";
   return [
+    "Lead role definition:",
+    LEAD_ROLE_PROMPT,
+    "",
     "Execute this queue-backed Board task through Team Chat orchestration.",
     "",
     `Board title: ${task.title}`,
@@ -445,7 +449,8 @@ function buildBoardExecutionPrompt(task: TeamQueueTask, run: TeamQueueRun, team:
     roster || "- none",
     "",
     "Return a concise final response that summarizes the real work performed or clearly explains any failure, blocker, or no-output condition.",
-    "You MUST end with an OV_FINAL block.",
+    "If another member must act before the Board result is known, end with an OV_DELEGATE block instead.",
+    "You MUST end with OV_FINAL or OV_DELEGATE as defined in the Lead role definition.",
     "",
     "Exact final block format:",
     "<OV_FINAL>",

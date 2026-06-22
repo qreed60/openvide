@@ -6,6 +6,7 @@ import {
   finishOrchestratorRun,
   startOrchestratorRun,
 } from "./orchestratorRunStore.js";
+import { LEAD_ROLE_PROMPT } from "./rolePrompts.js";
 import { getCoordinatorMember, normalizeTeamRole } from "./teamRoles.js";
 import type { TeamConfig, TeamMember, TeamMessageOrchestration } from "./types.js";
 
@@ -105,7 +106,7 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
     case "planner":
       return "You are the planner. Coordinate work and delegate bounded tasks through OV_DELEGATE.";
     case "lead":
-      return "You are the lead. Coordinate, delegate, unblock, and provide final user-facing answers.";
+      return "Follow the canonical Lead role definition below.";
     case "scribe":
       return "You are the scribe. Capture decisions, summarize delegated work, and provide compact written synthesis.";
     case "tester":
@@ -173,6 +174,10 @@ export function buildLeadInitialPrompt(
   return [
     `You are ${lead.name}, the ${lead.role} for OpenVide team "${team.name}".`,
     getRoleExecutionGuidance(lead.role),
+    "",
+    "Lead role definition:",
+    LEAD_ROLE_PROMPT,
+    "",
     `Working directory: ${team.workingDirectory}`,
     "",
     "You are participating in daemon-side Team Chat orchestration.",
@@ -217,6 +222,9 @@ export function buildLeadReviewPrompt(results: DelegationResult[]): string {
     .join("\n\n");
 
   return [
+    "Lead role definition:",
+    LEAD_ROLE_PROMPT,
+    "",
     "The following delegated tasks have completed.",
     "",
     "<OV_DELEGATION_RESULTS>",
@@ -270,6 +278,9 @@ export function buildDelegatedTaskPrompt(team: TeamConfig, member: TeamMember, t
 
 function buildRepairPrompt(parseError: string, leadText: string): string {
   return [
+    "Lead role definition:",
+    LEAD_ROLE_PROMPT,
+    "",
     "Your previous Team Chat orchestration response could not be parsed.",
     "",
     `Parse error: ${parseError}`,
@@ -295,6 +306,9 @@ function buildRepairPrompt(parseError: string, leadText: string): string {
 
 function buildForceFinalPrompt(): string {
   return [
+    "Lead role definition:",
+    LEAD_ROLE_PROMPT,
+    "",
     `The daemon-side Team Chat orchestrator has reached maxCycles=${MAX_CYCLES}.`,
     "You must now emit a final user-facing answer.",
     "",

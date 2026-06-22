@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { LEAD_ROLE_PROMPT } from "./rolePrompts.js";
 import type { TeamConfig } from "./types.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openvide-team-board-execution-"));
@@ -115,10 +116,21 @@ async function smokeBoardDispatchesThroughOrchestrator(): Promise<void> {
   assert.ok(prompts.some((prompt) => prompt.includes("Board title: 10J board execution smoke")));
   assert.ok(prompts.some((prompt) => prompt.includes("Assigned member intent: Coder.")));
   assert.ok(prompts.some((prompt) => prompt.includes("Priority: 91")));
-  assert.ok(prompts.some((prompt) => prompt.includes("You MUST end with an OV_FINAL block.")));
+  assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes("Do not simulate Coder, Reviewer, Scribe, Visual Reviewer, OpenHands, or OpenCode.")));
+  assert.ok(prompts.some((prompt) => prompt.includes("You MUST end with OV_FINAL or OV_DELEGATE as defined in the Lead role definition.")));
   assert.ok(prompts.some((prompt) => prompt.includes("<OV_FINAL>\nFinal Board result summary here.\n</OV_FINAL>")));
   assert.ok(turn?.providerStartedAt);
   assert.ok(turn?.executionTimeoutStartedAt);
+}
+
+function smokeLeadRolePromptContract(): void {
+  assert.ok(LEAD_ROLE_PROMPT.includes("You are Lead."));
+  assert.ok(LEAD_ROLE_PROMPT.includes("Do not simulate Coder, Reviewer, Scribe, Visual Reviewer, OpenHands, or OpenCode."));
+  assert.ok(LEAD_ROLE_PROMPT.includes("<OV_FINAL>"));
+  assert.ok(LEAD_ROLE_PROMPT.includes("</OV_FINAL>"));
+  assert.ok(LEAD_ROLE_PROMPT.includes("<OV_DELEGATE>"));
+  assert.ok(LEAD_ROLE_PROMPT.includes("</OV_DELEGATE>"));
 }
 
 async function smokeBoardUnstructuredLeadOutputCompletesWithFallback(): Promise<void> {
@@ -296,6 +308,7 @@ async function smokeBoardWaitingDoesNotStartProviderTimeout(): Promise<void> {
   assert.equal(waitingTurn?.executionTimeoutStartedAt, undefined);
 }
 
+smokeLeadRolePromptContract();
 await smokeBoardDispatchesThroughOrchestrator();
 await smokeBoardUnstructuredLeadOutputCompletesWithFallback();
 await smokeBoardNoOutputFailsWithDiagnostic();

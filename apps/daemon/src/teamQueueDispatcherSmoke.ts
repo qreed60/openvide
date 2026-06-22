@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { LEAD_ROLE_PROMPT } from "./rolePrompts.js";
 import type { TeamConfig } from "./types.js";
 import type { TeamQueueState } from "./teamQueueTypes.js";
 
@@ -74,12 +75,14 @@ async function smokeBasicDispatch(): Promise<void> {
   installTeams(team);
   const queued = queueChat(team.id, "Basic queued chat");
   let calls = 0;
+  const prompts: string[] = [];
 
   const result = await dispatchTeamQueueOnce({
     statePath,
     persistChatMessages: false,
-    executeMember: async () => {
+    executeMember: async ({ prompt }) => {
       calls += 1;
+      prompts.push(prompt);
       return {
         status: "idle",
         responseText: "<OV_FINAL>\nqueued chat completed\n</OV_FINAL>",
@@ -95,6 +98,8 @@ async function smokeBasicDispatch(): Promise<void> {
   assert.equal(state.runs[queued.run.id]?.metadata?.assistantText, "queued chat completed");
   assert.deepEqual(state.runs[queued.run.id]?.route, ["Lead"]);
   assert.equal((state.runs[queued.run.id]?.metadata?.queuedChatResult as { memberName?: string } | undefined)?.memberName, "Lead");
+  assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes("Do not simulate Coder, Reviewer, Scribe, Visual Reviewer, OpenHands, or OpenCode.")));
   assert.ok(Object.values(state.turns).some((turn) => turn.runId === queued.run.id && turn.status === "completed"));
   assert.ok(result.events.some((event) => event.type === "task_dispatch_started"));
   assert.ok(result.events.some((event) => event.type === "model_resource_acquired"));
