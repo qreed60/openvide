@@ -57,14 +57,14 @@ function installTeams(...teams: TeamConfig[]): void {
   state.teams = Object.fromEntries(teams.map((team) => [team.id, team]));
 }
 
-function queueChat(teamId: string, title: string, priority = 50) {
+function queueChat(teamId: string, title: string, priority = 50, clientMessageId?: string) {
   return createTeamQueueTask({
     teamId,
     source: "chat",
     title,
     description: title,
     priority,
-    metadata: { from: "user", to: "*" },
+    metadata: { from: "user", to: "*", clientMessageId },
   }, { statePath });
 }
 
@@ -99,6 +99,50 @@ async function smokeBasicDispatch(): Promise<void> {
   assert.ok(result.events.some((event) => event.type === "task_dispatch_started"));
   assert.ok(result.events.some((event) => event.type === "model_resource_acquired"));
   assert.ok(result.events.some((event) => event.type === "model_resource_released"));
+}
+
+async function smokeQueuedChatPersistsQueueLinkage(): Promise<void> {
+  resetQueue();
+  const team = makeTeam("team_persist_linkage", "model-persist");
+  installTeams(team);
+  const queued = queueChat(team.id, "Persist linked queued chat", 50, "client-message-persist-1");
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    executeMember: async () => ({
+      status: "idle",
+      responseText: "<OV_FINAL>\nlinked assistant response\n</OV_FINAL>",
+    }),
+  });
+
+  const messagesPath = path.join(tmpDir, ".openvide-daemon", "teams", team.id, "messages.jsonl");
+  const messages = fs.readFileSync(messagesPath, "utf8")
+    .trim()
+    .split(/\n+/)
+    .map((line) => JSON.parse(line) as {
+      from?: string;
+      to?: string;
+      text?: string;
+      source?: string;
+      clientMessageId?: string;
+      queueTaskId?: string;
+      queueRunId?: string;
+      queueRunIds?: string[];
+    });
+  const userMessage = messages.find((message) => message.from === "user");
+  const assistantMessage = messages.find((message) => message.to === "user" && message.from === "Lead");
+
+  assert.deepEqual(result.dispatchedRunIds, [queued.run.id]);
+  assert.equal(userMessage?.source, "queued_chat");
+  assert.equal(userMessage?.clientMessageId, "client-message-persist-1");
+  assert.equal(userMessage?.queueTaskId, queued.task.id);
+  assert.equal(userMessage?.queueRunId, queued.run.id);
+  assert.deepEqual(userMessage?.queueRunIds, [queued.run.id]);
+  assert.equal(assistantMessage?.source, "queued_chat_result");
+  assert.equal(assistantMessage?.clientMessageId, "client-message-persist-1");
+  assert.equal(assistantMessage?.queueTaskId, queued.task.id);
+  assert.equal(assistantMessage?.queueRunId, queued.run.id);
+  assert.deepEqual(assistantMessage?.queueRunIds, [queued.run.id]);
 }
 
 async function smokeNoOutputFailsWithDiagnostic(): Promise<void> {
@@ -259,6 +303,7 @@ async function smokeReloadAndCancel(): Promise<void> {
 }
 
 await smokeBasicDispatch();
+await smokeQueuedChatPersistsQueueLinkage();
 await smokeNoOutputFailsWithDiagnostic();
 await smokeSameTeamWaits();
 await smokeSameResourceWaits();

@@ -419,6 +419,11 @@ export interface TeamMessage {
   fromTool?: TeamTool;
   to: string;
   text: string;
+  source?: string;
+  clientMessageId?: string;
+  queueTaskId?: string;
+  queueRunId?: string;
+  queueRunIds?: string[];
   createdAt: string;
   orchestration?: TeamMessageOrchestration;
 }

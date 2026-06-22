@@ -596,6 +596,10 @@ async function executeChatRun(
     to,
     text,
     persistMessages: ctx.options?.persistChatMessages,
+    clientMessageId: typeof task.metadata?.clientMessageId === "string" ? task.metadata.clientMessageId : undefined,
+    queueTaskId: task.id,
+    queueRunId: run.id,
+    queueRunIds: task.runIds,
     invokeMember: (member, prompt) => executeQueuedMemberTurn(ctx, task, run, team, member, prompt),
   });
 }

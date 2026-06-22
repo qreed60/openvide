@@ -559,7 +559,18 @@ export function addComment(teamId: string, taskId: string, author: string, text:
 
 function writeTeamMessage(
   teamId: string,
-  input: { from: string; to: string; text: string; fromTool?: TeamTool; orchestration?: TeamMessageOrchestration },
+  input: {
+    from: string;
+    to: string;
+    text: string;
+    fromTool?: TeamTool;
+    orchestration?: TeamMessageOrchestration;
+    source?: string;
+    clientMessageId?: string;
+    queueTaskId?: string;
+    queueRunId?: string;
+    queueRunIds?: string[];
+  },
 ): TeamMessage {
   const team = getTeam(teamId);
   const memberTool = team?.members.find((member) => member.name === input.from)?.tool;
@@ -570,6 +581,11 @@ function writeTeamMessage(
     fromTool: input.fromTool ?? memberTool,
     to: input.to,
     text: input.text,
+    source: input.source,
+    clientMessageId: input.clientMessageId,
+    queueTaskId: input.queueTaskId,
+    queueRunId: input.queueRunId,
+    queueRunIds: input.queueRunIds,
     orchestration: input.orchestration,
     createdAt: nowISO(),
   };
@@ -1006,6 +1022,10 @@ export async function runQueuedTeamChat(input: {
   text: string;
   invokeMember?: TeamMemberTurnInvoker;
   persistMessages?: boolean;
+  clientMessageId?: string;
+  queueTaskId?: string;
+  queueRunId?: string;
+  queueRunIds?: string[];
 }): Promise<QueuedTeamChatResult> {
   const team = getTeam(input.teamId);
   if (!team) throw new Error(`Team ${input.teamId} not found`);
@@ -1019,6 +1039,11 @@ export async function runQueuedTeamChat(input: {
       from: input.from,
       to: input.to,
       text: input.text,
+      source: "queued_chat",
+      clientMessageId: input.clientMessageId,
+      queueTaskId: input.queueTaskId,
+      queueRunId: input.queueRunId,
+      queueRunIds: input.queueRunIds,
     })
     : undefined;
   let assistant: QueuedTeamChatResult["assistant"];
@@ -1040,6 +1065,11 @@ export async function runQueuedTeamChat(input: {
         from: fromName,
         to: "user",
         text,
+        source: "queued_chat_result",
+        clientMessageId: input.clientMessageId,
+        queueTaskId: input.queueTaskId,
+        queueRunId: input.queueRunId,
+        queueRunIds: input.queueRunIds,
         orchestration,
       });
     },
