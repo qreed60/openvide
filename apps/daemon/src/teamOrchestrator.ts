@@ -6,7 +6,7 @@ import {
   finishOrchestratorRun,
   startOrchestratorRun,
 } from "./orchestratorRunStore.js";
-import { LEAD_ROLE_PROMPT } from "./rolePrompts.js";
+import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT } from "./rolePrompts.js";
 import { getCoordinatorMember, normalizeTeamRole } from "./teamRoles.js";
 import type { TeamConfig, TeamMember, TeamMessageOrchestration } from "./types.js";
 
@@ -100,7 +100,7 @@ function getMember(team: TeamConfig, name: string): TeamMember | undefined {
 function getRoleExecutionGuidance(role: TeamMember["role"]): string {
   switch (normalizeTeamRole(role)) {
     case "coder":
-      return "You are the implementation owner. Create or modify files only when a delegated task explicitly allows edits.";
+      return CODER_ROLE_PROMPT;
     case "reviewer":
       return "You are the reviewer/validator. Review, verify, and report concrete issues or risks.";
     case "planner":
@@ -118,6 +118,10 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
     default:
       return "";
   }
+}
+
+function getDelegatedRolePrompt(role: TeamMember["role"]): string {
+  return normalizeTeamRole(role) === "coder" ? CODER_ROLE_PROMPT : "";
 }
 
 function extractTaggedBlock(text: string, tag: string): string | null {
@@ -240,10 +244,13 @@ export function buildLeadReviewPrompt(results: DelegationResult[]): string {
 }
 
 export function buildDelegatedTaskPrompt(team: TeamConfig, member: TeamMember, task: DelegationTask): string {
+  const delegatedRolePrompt = getDelegatedRolePrompt(member.role);
   return [
     `You are the OpenVide Team member named: ${member.name}.`,
     `Your role is: ${member.role}.`,
     `You are working in: ${team.workingDirectory}.`,
+    "",
+    delegatedRolePrompt,
     "",
     "The Lead delegated this bounded task to you.",
     "",
@@ -273,7 +280,7 @@ export function buildDelegatedTaskPrompt(team: TeamConfig, member: TeamMember, t
     "risks:",
     "recommended_next_step:",
     "</OV_RESULT>",
-  ].join("\n");
+  ].filter((line, index, lines) => line || lines[index - 1]).join("\n");
 }
 
 function buildRepairPrompt(parseError: string, leadText: string): string {

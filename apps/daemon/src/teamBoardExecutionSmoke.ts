@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { LEAD_ROLE_PROMPT } from "./rolePrompts.js";
+import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT } from "./rolePrompts.js";
 import type { TeamConfig } from "./types.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openvide-team-board-execution-"));
@@ -131,6 +131,82 @@ function smokeLeadRolePromptContract(): void {
   assert.ok(LEAD_ROLE_PROMPT.includes("</OV_FINAL>"));
   assert.ok(LEAD_ROLE_PROMPT.includes("<OV_DELEGATE>"));
   assert.ok(LEAD_ROLE_PROMPT.includes("</OV_DELEGATE>"));
+}
+
+function smokeCoderRolePromptContract(): void {
+  assert.ok(CODER_ROLE_PROMPT.includes("You are Coder."));
+  assert.ok(CODER_ROLE_PROMPT.includes("Stay inside the assigned repository or worktree."));
+  assert.ok(CODER_ROLE_PROMPT.includes("Run relevant validation commands when available and feasible."));
+  assert.ok(CODER_ROLE_PROMPT.includes("Do not claim tests passed unless they actually ran."));
+  assert.ok(CODER_ROLE_PROMPT.includes("Do not perform review, approval, QA sign-off, or final sign-off as Reviewer."));
+}
+
+async function smokeBoardLeadDelegatesToCoderWithRolePrompt(): Promise<void> {
+  resetQueue();
+  const team = makeTeam("team_board_coder_delegate", "board-coder-model");
+  installTeams(team);
+  const created = createTeamBoardItem({
+    teamId: team.id,
+    title: "10J Coder role delegation smoke",
+    description: "Ask Coder to inspect code and report without editing files.",
+    assignedMembers: ["Coder"],
+    priority: 92,
+    createdBy: "smoke",
+  }, { statePath });
+  const prompts: string[] = [];
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async ({ member, prompt }) => {
+      prompts.push(prompt);
+      if (member.name === "Lead" && prompt.includes("Board title: 10J Coder role delegation smoke")) {
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_DELEGATE>",
+            "[{\"to\":\"Coder\",\"task\":\"Inspect the delegated Board task and report that no file edits are required.\",\"expected_summary\":\"Coder reports files changed, validation, and blockers.\"}]",
+            "</OV_DELEGATE>",
+          ].join("\n"),
+        };
+      }
+      if (member.name === "Coder") {
+        assert.ok(prompt.includes(CODER_ROLE_PROMPT));
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_RESULT>",
+            "status: completed",
+            "summary: inspected the task; no edits required.",
+            "files_changed: none",
+            "tests_run: not run; no code changes.",
+            "risks: none",
+            "recommended_next_step: Lead can finalize.",
+            "</OV_RESULT>",
+          ].join("\n"),
+        };
+      }
+      return {
+        status: "idle",
+        responseText: "<OV_FINAL>\nCoder reported no file edits were required.\n</OV_FINAL>",
+      };
+    },
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  const run = state.runs[created.queueRuns[0]!.id];
+  const task = state.tasks[created.queueTask.id];
+  const boardItem = getTeamBoardItem(created.boardItem.id, { statePath });
+
+  assert.deepEqual(result.dispatchedRunIds, [created.queueRuns[0]!.id]);
+  assert.equal(task?.status, "completed");
+  assert.equal(run?.status, "completed");
+  assert.equal(boardItem?.executionStatus, "completed");
+  assert.equal(boardItem?.resultSummary, "Coder reported no file edits were required.");
+  assert.deepEqual(boardItem?.resultRoute, ["Lead", "Coder", "Lead"]);
+  assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes(CODER_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes("Do not perform review, approval, QA sign-off, or final sign-off as Reviewer.")));
 }
 
 async function smokeBoardUnstructuredLeadOutputCompletesWithFallback(): Promise<void> {
@@ -309,7 +385,9 @@ async function smokeBoardWaitingDoesNotStartProviderTimeout(): Promise<void> {
 }
 
 smokeLeadRolePromptContract();
+smokeCoderRolePromptContract();
 await smokeBoardDispatchesThroughOrchestrator();
+await smokeBoardLeadDelegatesToCoderWithRolePrompt();
 await smokeBoardUnstructuredLeadOutputCompletesWithFallback();
 await smokeBoardNoOutputFailsWithDiagnostic();
 await smokeQueuedChatUnstructuredLeadOutputStillFails();
