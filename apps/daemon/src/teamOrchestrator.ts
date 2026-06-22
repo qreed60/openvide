@@ -6,7 +6,7 @@ import {
   finishOrchestratorRun,
   startOrchestratorRun,
 } from "./orchestratorRunStore.js";
-import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT } from "./rolePrompts.js";
+import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT, SCRIBE_ROLE_PROMPT } from "./rolePrompts.js";
 import { getCoordinatorMember, normalizeTeamRole } from "./teamRoles.js";
 import type { TeamConfig, TeamMember, TeamMessageOrchestration } from "./types.js";
 
@@ -108,9 +108,8 @@ function getRoleExecutionGuidance(role: TeamMember["role"]): string {
     case "lead":
       return "Follow the canonical Lead role definition below.";
     case "scribe":
-      return "You are the scribe. Capture decisions, summarize delegated work, and provide compact written synthesis.";
     case "tester":
-      return "You are the tester. Validate behavior, run focused checks when useful, and report pass/fail status and risks.";
+      return SCRIBE_ROLE_PROMPT;
     case "visual":
       return "You are the visual specialist. Focus on UI quality, interaction details, and visible regressions.";
     case "visual_reviewer":
@@ -126,6 +125,9 @@ function getDelegatedRolePrompt(role: TeamMember["role"]): string {
       return CODER_ROLE_PROMPT;
     case "reviewer":
       return REVIEWER_ROLE_PROMPT;
+    case "scribe":
+    case "tester":
+      return SCRIBE_ROLE_PROMPT;
     default:
       return "";
   }

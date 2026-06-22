@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT } from "./rolePrompts.js";
+import { CODER_ROLE_PROMPT, LEAD_ROLE_PROMPT, REVIEWER_ROLE_PROMPT, SCRIBE_ROLE_PROMPT } from "./rolePrompts.js";
 import type { TeamConfig } from "./types.js";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openvide-team-board-execution-"));
@@ -71,6 +71,18 @@ function makeReviewerTeam(id: string, model: string): TeamConfig {
     model,
     role: "reviewer",
     sessionId: `session_${id}_reviewer`,
+  });
+  return team;
+}
+
+function makeScribeTeam(id: string, model: string): TeamConfig {
+  const team = makeTeam(id, model);
+  team.members.push({
+    name: "Scribe",
+    tool: "codex",
+    model,
+    role: "scribe",
+    sessionId: `session_${id}_scribe`,
   });
   return team;
 }
@@ -162,6 +174,14 @@ function smokeReviewerRolePromptContract(): void {
   assert.ok(REVIEWER_ROLE_PROMPT.includes("If blocked by missing context, missing diffs, missing queue/run metadata, or missing validation output"));
 }
 
+function smokeScribeRolePromptContract(): void {
+  assert.ok(SCRIBE_ROLE_PROMPT.includes("You are Scribe."));
+  assert.ok(SCRIBE_ROLE_PROMPT.includes("Evidence extraction rule: use only available task context, queue/run metadata, outputs, logs, diffs, command output, and validation output"));
+  assert.ok(SCRIBE_ROLE_PROMPT.includes("Validation evidence rule: do not claim validation passed unless validation output is present."));
+  assert.ok(SCRIBE_ROLE_PROMPT.includes("No-code-implementation rule: do not modify files unless explicitly delegated a documentation-only edit task."));
+  assert.ok(SCRIBE_ROLE_PROMPT.includes("No-review-signoff rule: do not perform final review, approval, QA sign-off, or final sign-off as Reviewer."));
+}
+
 async function smokeBoardLeadDelegatesToCoderWithRolePrompt(): Promise<void> {
   resetQueue();
   const team = makeTeam("team_board_coder_delegate", "board-coder-model");
@@ -228,6 +248,78 @@ async function smokeBoardLeadDelegatesToCoderWithRolePrompt(): Promise<void> {
   assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
   assert.ok(prompts.some((prompt) => prompt.includes(CODER_ROLE_PROMPT)));
   assert.ok(prompts.some((prompt) => prompt.includes("Do not perform review, approval, QA sign-off, or final sign-off as Reviewer.")));
+}
+
+async function smokeBoardLeadDelegatesToScribeWithRolePrompt(): Promise<void> {
+  resetQueue();
+  const team = makeScribeTeam("team_board_scribe_delegate", "board-scribe-model");
+  installTeams(team);
+  const created = createTeamBoardItem({
+    teamId: team.id,
+    title: "10J Scribe role delegation smoke",
+    description: "Ask Scribe to summarize available queue evidence without editing files.",
+    assignedMembers: ["Scribe"],
+    priority: 94,
+    createdBy: "smoke",
+  }, { statePath });
+  const prompts: string[] = [];
+
+  const result = await dispatchTeamQueueOnce({
+    statePath,
+    persistChatMessages: false,
+    executeMember: async ({ member, prompt }) => {
+      prompts.push(prompt);
+      if (member.name === "Lead" && prompt.includes("Board title: 10J Scribe role delegation smoke")) {
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_DELEGATE>",
+            "[{\"to\":\"Scribe\",\"task\":\"Summarize available queue evidence, changed files, commands, validation output, blockers, and next actions. Do not edit files.\",\"expected_summary\":\"Scribe reports evidence reviewed, missing evidence, files changed, validation, blockers, and next actions.\"}]",
+            "</OV_DELEGATE>",
+          ].join("\n"),
+        };
+      }
+      if (member.name === "Scribe") {
+        assert.ok(prompt.includes(SCRIBE_ROLE_PROMPT));
+        assert.ok(prompt.includes("Evidence extraction rule: use only available task context, queue/run metadata, outputs, logs, diffs, command output, and validation output"));
+        assert.ok(prompt.includes("Validation evidence rule: do not claim validation passed unless validation output is present."));
+        assert.ok(prompt.includes("No-code-implementation rule: do not modify files unless explicitly delegated a documentation-only edit task."));
+        assert.ok(prompt.includes("No-review-signoff rule: do not perform final review, approval, QA sign-off, or final sign-off as Reviewer."));
+        return {
+          status: "idle",
+          responseText: [
+            "<OV_RESULT>",
+            "status: completed",
+            "summary: queue evidence was summarized; no validation output was present.",
+            "files_changed: none",
+            "tests_run: not run; no validation output was available to summarize.",
+            "risks: validation cannot be claimed without output.",
+            "recommended_next_step: Lead should report the missing validation evidence.",
+            "</OV_RESULT>",
+          ].join("\n"),
+        };
+      }
+      return {
+        status: "idle",
+        responseText: "<OV_FINAL>\nScribe summarized available evidence and reported validation as missing.\n</OV_FINAL>",
+      };
+    },
+  });
+
+  const state = loadTeamQueueState({ statePath, recoverStaleActive: false });
+  const run = state.runs[created.queueRuns[0]!.id];
+  const task = state.tasks[created.queueTask.id];
+  const boardItem = getTeamBoardItem(created.boardItem.id, { statePath });
+
+  assert.deepEqual(result.dispatchedRunIds, [created.queueRuns[0]!.id]);
+  assert.equal(task?.status, "completed");
+  assert.equal(run?.status, "completed");
+  assert.equal(boardItem?.executionStatus, "completed");
+  assert.equal(boardItem?.resultSummary, "Scribe summarized available evidence and reported validation as missing.");
+  assert.deepEqual(boardItem?.resultRoute, ["Lead", "Scribe", "Lead"]);
+  assert.ok(prompts.some((prompt) => prompt.includes(LEAD_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes(SCRIBE_ROLE_PROMPT)));
+  assert.ok(prompts.some((prompt) => prompt.includes("Do not act as Lead or make delegation decisions.")));
 }
 
 async function smokeBoardLeadDelegatesToReviewerWithRolePrompt(): Promise<void> {
@@ -477,8 +569,10 @@ async function smokeBoardWaitingDoesNotStartProviderTimeout(): Promise<void> {
 smokeLeadRolePromptContract();
 smokeCoderRolePromptContract();
 smokeReviewerRolePromptContract();
+smokeScribeRolePromptContract();
 await smokeBoardDispatchesThroughOrchestrator();
 await smokeBoardLeadDelegatesToCoderWithRolePrompt();
+await smokeBoardLeadDelegatesToScribeWithRolePrompt();
 await smokeBoardLeadDelegatesToReviewerWithRolePrompt();
 await smokeBoardUnstructuredLeadOutputCompletesWithFallback();
 await smokeBoardNoOutputFailsWithDiagnostic();
